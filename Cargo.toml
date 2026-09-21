@@ -1,0 +1,49 @@
+[package]
+name = "webmcp-daemon"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+description = "webmcp.fast daemon: pairs a machine and relays local MCP servers"
+license = "Apache-2.0"
+repository = "https://github.com/proticom/webmcp"
+homepage = "https://webmcp.fast"
+readme = "README.md"
+keywords = ["mcp", "model-context-protocol", "agents", "relay"]
+categories = ["command-line-utilities", "network-programming"]
+publish = false
+
+[[bin]]
+name = "webmcp"
+path = "src/main.rs"
+
+[lib]
+name = "webmcp_daemon"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+base64 = "0.22.1"
+clap = { version = "4.6.7", features = ["derive"] }
+directories = "6.0.0"
+ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+hex = "0.4.3"
+hostname = "0.4.2"
+machine-uid = "0.6.0"
+rand = "0.8.8"
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.10.9"
+shell-words = "1.1.0"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "signal", "process", "io-util"] }
+tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
+toml = "1.1.6"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+url = "2.5.8"
+
+[dev-dependencies]
+jsonschema = { version = "0.56.0", default-features = false }
+tempfile = "3.27.0"

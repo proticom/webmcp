@@ -1,0 +1,8 @@
+# Default owner
+*                     @edtadros
+# Security-sensitive paths
+/.github/             @edtadros
+/SECURITY.md          @edtadros
+/THREAT_MODEL.md      @edtadros
+/scripts/install.sh   @edtadros
+/docs/PROTOCOL.md     @edtadros

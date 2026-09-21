@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://webmcp.fast/schema/relay-v1.json",
+  "title": "webmcp.fast relay frame v1",
+  "oneOf": [
+    { "$ref": "#/$defs/hello" },
+    { "$ref": "#/$defs/challenge" },
+    { "$ref": "#/$defs/auth" },
+    { "$ref": "#/$defs/welcome" },
+    { "$ref": "#/$defs/servers" },
+    { "$ref": "#/$defs/error" },
+    { "$ref": "#/$defs/session_open" },
+    { "$ref": "#/$defs/session_close" },
+    { "$ref": "#/$defs/mcp" }
+  ],
+  "$defs": {
+    "hello": {
+      "type": "object",
+      "required": ["t", "v", "device_id", "daemon_version", "platform"],
+      "properties": {
+        "t": { "const": "hello" },
+        "v": { "const": 1 },
+        "device_id": { "type": "string", "pattern": "^dev_[A-Za-z0-9]{16,}$" },
+        "daemon_version": { "type": "string" },
+        "platform": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "challenge": {
+      "type": "object",
+      "required": ["t", "nonce"],
+      "properties": { "t": { "const": "challenge" }, "nonce": { "type": "string" } },
+      "additionalProperties": false
+    },
+    "auth": {
+      "type": "object",
+      "required": ["t", "signature"],
+      "properties": { "t": { "const": "auth" }, "signature": { "type": "string" } },
+      "additionalProperties": false
+    },
+    "welcome": {
+      "type": "object",
+      "required": ["t", "handle", "device", "server_time"],
+      "properties": {
+        "t": { "const": "welcome" },
+        "handle": { "type": "string" },
+        "device": { "type": "string" },
+        "server_time": { "type": "string", "format": "date-time" }
+      },
+      "additionalProperties": false
+    },
+    "server_info": {
+      "type": "object",
+      "required": ["alias", "transport", "mode", "status"],
+      "properties": {
+        "alias": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,31}$" },
+        "transport": { "enum": ["stdio", "http"] },
+        "mode": { "enum": ["per-session", "shared", "exclusive"] },
+        "status": { "enum": ["ready", "error"] },
+        "error": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "servers": {
+      "type": "object",
+      "required": ["t", "servers"],
+      "properties": {
+        "t": { "const": "servers" },
+        "servers": { "type": "array", "items": { "$ref": "#/$defs/server_info" } }
+      },
+      "additionalProperties": false
+    },
+    "error": {
+      "type": "object",
+      "required": ["t", "code"],
+      "properties": {
+        "t": { "const": "error" },
+        "code": { "type": "string" },
+        "message": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "session_open": {
+      "type": "object",
+      "required": ["t", "sid", "server"],
+      "properties": {
+        "t": { "const": "session_open" },
+        "sid": { "type": "string", "pattern": "^ses_[A-Za-z0-9]{16,}$" },
+        "server": { "type": "string" },
+        "client": {
+          "type": "object",
+          "properties": { "name": { "type": "string" }, "version": { "type": "string" } },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "session_close": {
+      "type": "object",
+      "required": ["t", "sid"],
+      "properties": {
+        "t": { "const": "session_close" },
+        "sid": { "type": "string" },
+        "reason": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "mcp": {
+      "type": "object",
+      "required": ["t", "sid", "msg"],
+      "properties": {
+        "t": { "const": "mcp" },
+        "sid": { "type": "string" },
+        "msg": { "type": "object" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,0 +1,32 @@
+[
+  {
+    "t": "hello",
+    "v": 1,
+    "device_id": "dev_0123456789abcdef",
+    "daemon_version": "0.1.0",
+    "platform": "macos-aarch64"
+  },
+  { "t": "challenge", "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" },
+  {
+    "t": "auth",
+    "signature": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+  },
+  { "t": "welcome", "handle": "alice", "device": "macbook", "server_time": "2026-09-19T21:00:00Z" },
+  {
+    "t": "servers",
+    "servers": [{ "alias": "gnosys", "transport": "http", "mode": "shared", "status": "ready" }]
+  },
+  { "t": "error", "code": "unauthorized" },
+  {
+    "t": "session_open",
+    "sid": "ses_0123456789abcdef",
+    "server": "gnosys",
+    "client": { "name": "claude", "version": "1.0" }
+  },
+  { "t": "session_close", "sid": "ses_0123456789abcdef", "reason": "client_disconnected" },
+  {
+    "t": "mcp",
+    "sid": "ses_0123456789abcdef",
+    "msg": { "jsonrpc": "2.0", "id": 1, "method": "tools/list" }
+  }
+]

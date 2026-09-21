@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+.env*
+*.pem
+*.p12
+*.key
+*.db
+.DS_Store
+.gnosys/
+.claude/
+.cursor/
+.codex/
+dist/
