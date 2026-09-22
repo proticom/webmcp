@@ -12,9 +12,14 @@ use crate::error::Error;
 /// Name of the key file inside the config directory.
 pub const KEY_FILE: &str = "device.key";
 
-/// Generate a fresh keypair from the OS CSPRNG.
+/// Generate a fresh keypair from the OS CSPRNG. The 32 secret bytes are drawn
+/// directly rather than through `SigningKey::generate`, whose `CryptoRng`
+/// bound ties us to one exact `rand_core` version.
 pub fn generate() -> SigningKey {
-    SigningKey::generate(&mut rand::rngs::OsRng)
+    use rand::RngCore;
+    let mut secret = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut secret);
+    SigningKey::from_bytes(&secret)
 }
 
 /// Public key, base64 (standard, padded), as sent in the pair request.
