@@ -47,10 +47,49 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: sh -n scripts/install.sh && shellcheck scripts/install.sh
 
+  # The npm distribution (npm/): manifests track Cargo.toml, the launcher
+  # parses, and a real install resolves the platform package and runs the
+  # binary through it.
+  npm:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest, platform: darwin-arm64, bin: webmcp }
+          - { os: ubuntu-latest, platform: linux-x64, bin: webmcp }
+          - { os: windows-latest, platform: win32-x64, bin: webmcp.exe }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - run: node scripts/sync-versions.mjs --check
+      - run: node --check npm/webmcp/bin/webmcp.js
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo build --release --locked
+      - name: Smoke test the launcher through a packed install
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp target/release/${{ matrix.bin }} npm/platforms/${{ matrix.platform }}/${{ matrix.bin }}
+          out="$RUNNER_TEMP/packs"; mkdir -p "$out"
+          (cd npm/platforms/${{ matrix.platform }} && npm pack --pack-destination "$out")
+          (cd npm/webmcp && npm pack --pack-destination "$out")
+          app="$RUNNER_TEMP/app"; mkdir -p "$app"; cd "$app"; npm init -y >/dev/null
+          # The other platform packages are not on the registry in CI; install
+          # the two tarballs directly so the main package resolves the host one.
+          npm install --no-audit --no-fund "$out"/proticom-webmcp-${{ matrix.platform }}-*.tgz "$out"/proticom-webmcp-[0-9]*.tgz
+          ./node_modules/.bin/webmcp --version
+          node node_modules/@proticom/webmcp/bin/webmcp.js --version
+          test "$(./node_modules/.bin/webmcp --version)" = "$(node node_modules/@proticom/webmcp/bin/webmcp.js --version)"
+
   # The one required status check. Add jobs to `needs`, never rename this job.
   ci-gate:
     if: always()
-    needs: [test, audit, installer]
+    needs: [test, audit, installer, npm]
     runs-on: ubuntu-latest
     steps:
       - run: |

@@ -11,3 +11,8 @@
 .cursor/
 .codex/
 dist/
+
+# npm platform packages: the binary is copied in at release/CI time
+/npm/platforms/*/webmcp
+/npm/platforms/*/webmcp.exe
+*.tgz

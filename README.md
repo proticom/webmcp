@@ -12,13 +12,28 @@ what the daemon can and cannot be made to do: `THREAT_MODEL.md`.
 
 ## Install
 
-macOS (Apple silicon or Intel) and Linux (x86_64, arm64):
+With Node 18+ (macOS Apple silicon or Intel, Linux x86_64 or arm64, Windows x64):
+
+    npm i -g @proticom/webmcp
+    webmcp up
+
+or, without installing, `npx @proticom/webmcp up`. The npm package is a small
+launcher with no runtime dependencies and no install script; the prebuilt
+binary comes from a platform package (`@proticom/webmcp-darwin-arm64` and so
+on) picked by npm. Every package is published from GitHub Actions with a
+provenance attestation: `npm audit signatures` verifies that what you
+installed was built by the release workflow in this repository.
+
+Linux, without Node: the GitHub release has one tarball and SHA-256 checksum
+per target ([releases](https://github.com/proticom/webmcp/releases)), and
+`scripts/install.sh` downloads, verifies and copies one binary to `~/.local/bin`:
 
     curl -fsSL https://webmcp.fast/install.sh | sh
 
-The script downloads one release tarball, verifies its SHA-256 checksum, and
-copies one binary to `~/.local/bin`. macOS binaries are signed and notarized.
-Read it first: `scripts/install.sh`. Or build from source (Rust 1.94+):
+Read it first. On macOS the script points you at npm instead, because the
+tarballs are not code-signed (there is no Apple Developer ID) and Gatekeeper
+blocks a downloaded unsigned binary; `WEBMCP_ALLOW_UNSIGNED=1` overrides.
+Windows gets a `.zip` on the release page. Or build from source (Rust 1.94+):
 
     cargo install --git https://github.com/proticom/webmcp --locked
     webmcp --version
@@ -41,8 +56,8 @@ One command, safe to run again at any point. It does only what is still missing:
    into the webmcp config** (that is how the server gets its API keys); the output names the variables,
    never the values. Remote-URL entries are listed as "remote, not attachable". `webmcp discover`
    shows the list on its own.
-3. **Background service** (macOS): asks at a terminal, `--service` installs without asking; otherwise it
-   says how. Elsewhere run `webmcp connect` under your own supervisor.
+3. **Background service** (macOS, Linux): asks at a terminal, `--service` installs without asking;
+   otherwise it says how. Elsewhere run `webmcp connect` under your own supervisor.
 4. **Reports** each server's URL, `https://<handle>.webmcp.fast/<device>/<alias>/mcp`. Paste it into
    Claude, ChatGPT or Grok as a custom connector, sign in, click Allow.
 
@@ -99,7 +114,7 @@ it polls `config.toml` and re-advertises the server list. Sessions on a detached
 the new one), everything else keeps running. A config that does not parse is ignored until it does.
 Only `servers` is reloaded; after `webmcp login --force`, restart `webmcp connect`.
 
-## Running in the background (macOS)
+## Running in the background (macOS, Linux)
 
 ```
 webmcp service install     # start at login, restart if it stops
@@ -107,11 +122,18 @@ webmcp service status
 webmcp service uninstall   # pairing and attached servers are kept
 ```
 
-This writes a per-user LaunchAgent (`~/Library/LaunchAgents/fast.webmcp.daemon.plist`,
-no sudo) that runs `webmcp connect`. It records your shell's `PATH` at install
-time, because stdio servers are usually launched through `npx`, `uvx` or a
-`#!/usr/bin/env node` shim that launchd's minimal `PATH` would not find: run
-`install` again after upgrading `webmcp` or changing your `PATH`. Logs go to
-`~/Library/Logs/webmcp/daemon.log`. If the gateway says the device must be
-paired again, the service stops instead of looping; `webmcp up --force --service`.
+On macOS this writes a per-user LaunchAgent (`~/Library/LaunchAgents/fast.webmcp.daemon.plist`,
+no sudo) that runs `webmcp connect`; logs go to `~/Library/Logs/webmcp/daemon.log`.
+On Linux it writes a systemd user unit (`~/.config/systemd/user/webmcp.service`,
+`Restart=on-failure`, no sudo) and runs `systemctl --user daemon-reload && enable
+&& restart`; logs go to `~/.local/state/webmcp/daemon.log` (and `journalctl --user -u webmcp`).
+A user unit only runs while you have a session; `loginctl enable-linger $USER`
+keeps it up after logout and across reboots. Both record your shell's `PATH` at
+install time, because stdio servers are usually launched through `npx`, `uvx` or a
+`#!/usr/bin/env node` shim that the supervisor's minimal `PATH` would not find: run
+`install` again after upgrading `webmcp` or changing your `PATH`. If the gateway
+says the device must be paired again, the service exits cleanly instead of looping
+(neither supervisor restarts a clean exit); `webmcp up --force --service`.
+Windows: the binary runs (`webmcp connect` in a terminal or under your own
+supervisor), but `webmcp service` is not available there yet.
 

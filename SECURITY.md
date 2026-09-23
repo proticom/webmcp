@@ -21,9 +21,12 @@ closed source; report issues with it the same way.
 
 ## What the project does to protect you
 
-- Releases are built by GitHub Actions from a tag, with checksums published
-  beside the binaries. macOS binaries are signed with an Apple Developer ID and
-  notarized.
+- Releases are built by GitHub Actions from a tag. The npm packages
+  (`@proticom/webmcp` and its platform packages) are published through OIDC
+  trusted publishing with provenance attestations, so `npm audit signatures`
+  can tie what you installed to the release workflow and commit; no long-lived
+  npm token exists. The GitHub release tarballs ship with SHA-256 checksums.
+  Binaries are not code-signed or notarized on any platform.
 - CI runs `cargo audit` against the RustSec advisory database on every change.
 - Dependabot watches Cargo and GitHub Actions dependencies.
 - Third-party GitHub Actions are pinned to full commit SHAs.

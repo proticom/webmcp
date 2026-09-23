@@ -1,0 +1,22 @@
+{
+  "name": "@proticom/webmcp-win32-x64",
+  "version": "0.1.0",
+  "description": "Prebuilt webmcp binary for win32 x64. Installed automatically by @proticom/webmcp; do not depend on it directly.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/proticom/webmcp.git",
+    "directory": "npm/platforms/win32-x64"
+  },
+  "homepage": "https://webmcp.fast",
+  "bugs": "https://github.com/proticom/webmcp/issues",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "webmcp.exe"
+  ]
+}
