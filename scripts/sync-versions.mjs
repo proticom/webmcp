@@ -35,11 +35,13 @@ if (tag && tag.startsWith("v") && tag !== `v${version}`) {
 
 const problems = [];
 function sync(file, edit) {
+  // Compare parsed content, not bytes: git may check package.json out with
+  // CRLF on Windows, which is not a version difference.
   const before = readFileSync(file, "utf8");
   const pkg = JSON.parse(before);
   edit(pkg);
   const after = JSON.stringify(pkg, null, 2) + "\n";
-  if (after === before) return;
+  if (JSON.stringify(pkg) === JSON.stringify(JSON.parse(before))) return;
   if (check) problems.push(file.slice(root.length + 1));
   else writeFileSync(file, after);
 }
