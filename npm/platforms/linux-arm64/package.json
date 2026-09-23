@@ -1,0 +1,22 @@
+{
+  "name": "@proticom/webmcp-linux-arm64",
+  "version": "0.1.0",
+  "description": "Prebuilt webmcp binary for linux arm64. Installed automatically by @proticom/webmcp; do not depend on it directly.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/proticom/webmcp.git",
+    "directory": "npm/platforms/linux-arm64"
+  },
+  "homepage": "https://webmcp.fast",
+  "bugs": "https://github.com/proticom/webmcp/issues",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "webmcp"
+  ]
+}

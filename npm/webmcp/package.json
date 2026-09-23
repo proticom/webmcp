@@ -1,0 +1,37 @@
+{
+  "name": "@proticom/webmcp",
+  "version": "0.1.0",
+  "description": "webmcp.fast daemon: expose local MCP servers to any agent harness through one outbound connection",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/proticom/webmcp.git",
+    "directory": "npm/webmcp"
+  },
+  "homepage": "https://webmcp.fast",
+  "bugs": "https://github.com/proticom/webmcp/issues",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "agents",
+    "relay",
+    "webmcp"
+  ],
+  "bin": {
+    "webmcp": "bin/webmcp.js"
+  },
+  "files": [
+    "bin",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "@proticom/webmcp-darwin-arm64": "0.1.0",
+    "@proticom/webmcp-darwin-x64": "0.1.0",
+    "@proticom/webmcp-linux-x64": "0.1.0",
+    "@proticom/webmcp-linux-arm64": "0.1.0",
+    "@proticom/webmcp-win32-x64": "0.1.0"
+  }
+}

@@ -19,7 +19,20 @@ need tar
 need uname
 
 case "$(uname -s)" in
-  Darwin) os="apple-darwin" ;;
+  Darwin)
+    os="apple-darwin"
+    # The release tarballs are not code-signed (no Apple Developer ID), so
+    # Gatekeeper quarantines and blocks a binary downloaded this way. npm does
+    # not quarantine what it installs, so that is the recommended route.
+    if [ "${WEBMCP_ALLOW_UNSIGNED:-}" != "1" ]; then
+      say "On macOS the recommended install is:"
+      say "    npm i -g @proticom/webmcp    (or: npx @proticom/webmcp up)"
+      say "The release tarballs are unsigned and Gatekeeper will block them."
+      say "To install one anyway (then: xattr -d com.apple.quarantine $DIR/webmcp):"
+      say "    curl -fsSL https://webmcp.fast/install.sh | WEBMCP_ALLOW_UNSIGNED=1 sh"
+      exit 0
+    fi
+    ;;
   Linux) os="unknown-linux-gnu" ;;
   *) die "unsupported OS: $(uname -s). Build from source: https://github.com/$REPO" ;;
 esac

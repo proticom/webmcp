@@ -56,7 +56,7 @@ enum Command {
     Detach { alias: String },
     /// List attached servers
     Servers,
-    /// Keep the daemon running in the background (macOS launchd)
+    /// Keep the daemon running in the background (macOS launchd, Linux systemd)
     Service {
         #[command(subcommand)]
         action: ServiceAction,
@@ -98,7 +98,7 @@ struct UpArgs {
     /// Do not offer discovered servers
     #[arg(long)]
     no_attach: bool,
-    /// Install the background service without asking (macOS)
+    /// Install the background service without asking (macOS, Linux)
     #[arg(long)]
     service: bool,
 }
@@ -357,7 +357,7 @@ async fn up(dir: PathBuf, args: UpArgs, json: bool) -> Result<i32> {
     let mut state = UpState {
         cfg: None,
         carried: Vec::new(),
-        service: if cfg!(target_os = "macos") {
+        service: if service::supported() {
             ServiceOutcome::Skipped
         } else {
             ServiceOutcome::Unsupported
@@ -480,7 +480,7 @@ async fn up_steps(
     }
 
     // 3. Background service.
-    if cfg!(target_os = "macos") {
+    if service::supported() {
         let home = home_dir()?;
         let st = service::status(&home)?;
         if st.installed && st.pid.is_some() {
@@ -500,6 +500,9 @@ async fn up_steps(
                 json,
                 format!("Background service installed (log: {}).", log.display()),
             );
+            if let Some(hint) = service::post_install_hint() {
+                say(json, hint);
+            }
             state.service = ServiceOutcome::Installed;
         } else {
             say(
@@ -510,7 +513,7 @@ async fn up_steps(
     } else {
         say(
             json,
-            "Background service: not available on this platform yet. Run `webmcp connect` under your own supervisor (systemd, tmux…).",
+            "Background service: not available on this platform yet. Run `webmcp connect` under your own supervisor.",
         );
     }
     Ok(())
@@ -752,7 +755,8 @@ fn home_dir() -> Result<PathBuf> {
         .context("HOME is not set")
 }
 
-/// Install (or refresh) the launchd service; returns the plist and log paths.
+/// Install (or refresh) the background service; returns the definition
+/// (plist or unit) and log paths.
 fn install_service(home: PathBuf) -> Result<(PathBuf, PathBuf)> {
     // Fail early, in the terminal, rather than silently in a log file.
     let dir = config::config_dir()?;
@@ -764,20 +768,23 @@ fn install_service(home: PathBuf) -> Result<(PathBuf, PathBuf)> {
         log_file: service::log_path(&home),
         home,
     };
-    let plist = service::install(&spec)?;
-    Ok((plist, spec.log_file))
+    let definition = service::install(&spec)?;
+    Ok((definition, spec.log_file))
 }
 
 fn service_cmd(action: ServiceAction, json: bool) -> Result<()> {
     let home = home_dir()?;
     match action {
         ServiceAction::Install => {
-            let (plist, log) = install_service(home)?;
+            let (definition, log) = install_service(home)?;
             println!("Installed and started the background service.");
             println!("It starts at login and restarts if it stops. `webmcp connect` is no longer needed.");
-            println!("definition: {}", plist.display());
+            println!("definition: {}", definition.display());
             println!("log:        {}", log.display());
             println!("Run this again after upgrading webmcp or if your PATH changes.");
+            if let Some(hint) = service::post_install_hint() {
+                println!("{hint}");
+            }
         }
         ServiceAction::Uninstall => {
             if service::uninstall(&home)? {
@@ -789,7 +796,7 @@ fn service_cmd(action: ServiceAction, json: bool) -> Result<()> {
             }
         }
         ServiceAction::Status if json => {
-            let supported = cfg!(target_os = "macos");
+            let supported = service::supported();
             let st = if supported {
                 service::status(&home)?
             } else {
