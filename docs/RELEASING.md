@@ -1,5 +1,7 @@
 # Releasing
 
+**One-time setup:** run `scripts/npm-bootstrap.sh` while logged in to npm. It publishes the six placeholder names and adds the GitHub Actions trusted publisher to each with `npm trust github`, so the manual steps below are only a fallback.
+
 A release is one git tag. Pushing `vX.Y.Z` runs `.github/workflows/release.yml`,
 which builds five binaries, creates the GitHub release (tarballs, a Windows
 zip, `SHA256SUMS`, `install.sh`) and publishes six npm packages:
