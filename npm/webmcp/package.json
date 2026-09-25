@@ -1,6 +1,6 @@
 {
   "name": "@proticom/webmcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "webmcp.fast daemon: expose local MCP servers to any agent harness through one outbound connection",
   "license": "Apache-2.0",
   "repository": {
@@ -28,10 +28,10 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "@proticom/webmcp-darwin-arm64": "0.1.0",
-    "@proticom/webmcp-darwin-x64": "0.1.0",
-    "@proticom/webmcp-linux-x64": "0.1.0",
-    "@proticom/webmcp-linux-arm64": "0.1.0",
-    "@proticom/webmcp-win32-x64": "0.1.0"
+    "@proticom/webmcp-darwin-arm64": "0.1.1",
+    "@proticom/webmcp-darwin-x64": "0.1.1",
+    "@proticom/webmcp-linux-x64": "0.1.1",
+    "@proticom/webmcp-linux-arm64": "0.1.1",
+    "@proticom/webmcp-win32-x64": "0.1.1"
   }
 }
