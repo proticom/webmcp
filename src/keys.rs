@@ -16,9 +16,9 @@ pub const KEY_FILE: &str = "device.key";
 /// directly rather than through `SigningKey::generate`, whose `CryptoRng`
 /// bound ties us to one exact `rand_core` version.
 pub fn generate() -> SigningKey {
-    use rand::RngCore;
+    use rand::rand_core::TryRng;
     let mut secret = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut secret);
+    rand::rngs::SysRng.try_fill_bytes(&mut secret).unwrap();
     SigningKey::from_bytes(&secret)
 }
 

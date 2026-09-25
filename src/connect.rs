@@ -219,7 +219,7 @@ pub async fn run(opts: &ConnectOptions) -> Result<Welcome, ConnectError> {
 /// Exponential backoff with jitter: `min * 2^attempt` capped at `max`, then
 /// randomized between half and full.
 pub fn backoff_delay(opts: &ConnectOptions, attempt: u32) -> Duration {
-    use rand::Rng;
+    use rand::RngExt;
     let exp = opts
         .backoff_min
         .checked_mul(1u32.checked_shl(attempt.min(31)).unwrap_or(u32::MAX))
@@ -227,7 +227,7 @@ pub fn backoff_delay(opts: &ConnectOptions, attempt: u32) -> Duration {
         .min(opts.backoff_max)
         .max(opts.backoff_min);
     let half = exp / 2;
-    let jitter_ms = rand::thread_rng().gen_range(0..=half.as_millis() as u64);
+    let jitter_ms = rand::rng().random_range(0..=half.as_millis() as u64);
     half + Duration::from_millis(jitter_ms)
 }
 

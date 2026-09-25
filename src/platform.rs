@@ -29,9 +29,9 @@ pub fn hardware_id() -> Option<String> {
 /// A random 64-hex-char id used when no machine id is available. The
 /// caller persists it so it stays stable across runs.
 pub fn random_hardware_id() -> String {
-    use rand::RngCore;
+    use rand::rand_core::TryRng;
     let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    rand::rngs::SysRng.try_fill_bytes(&mut bytes).unwrap();
     hex::encode(bytes)
 }
 
