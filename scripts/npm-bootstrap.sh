@@ -45,12 +45,14 @@ JSON
   fi
 done
 
+# `npm trust list` needs its own 2FA approval and its output cannot be trusted
+# as a "done" signal, so always ask npm to add the relationship; it refuses a
+# duplicate, which is fine on a rerun.
 for pkg in $PACKAGES; do
-  if npm trust list "$pkg" 2>/dev/null | grep -q "$REPO"; then
-    echo "trusted:   $pkg"
-  else
-    npm trust github "$pkg" --file "$WORKFLOW" --repository "$REPO" --environment "$ENVIRONMENT" --yes
+  if npm trust github "$pkg" --file "$WORKFLOW" --repository "$REPO" --environment "$ENVIRONMENT" --yes; then
     echo "trusted:   $pkg -> $REPO/$WORKFLOW ($ENVIRONMENT)"
+  else
+    echo "not added: $pkg (already trusted, or npm refused; see the message above)" >&2
   fi
 done
 
