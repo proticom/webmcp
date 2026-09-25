@@ -28,9 +28,11 @@ const DEFAULT_BASE_URL: &str = "https://webmcp.fast";
     long_about = None
 )]
 struct Cli {
-    /// Print exactly one JSON object on stdout (logs stay on stderr). `up`
-    /// prints one extra `approval_required` line first when it has to pair.
-    /// Exit codes: 0 ok, 1 error, 2 approval declined, 3 approval expired
+    /// Machine-readable output for up, discover, status, servers, attach,
+    /// detach and service status: one JSON object on stdout (logs stay on
+    /// stderr). `up` prints one extra `approval_required` line first when it
+    /// has to pair. Other commands emit JSON only on error. Exit codes: 0 ok,
+    /// 1 error, 2 approval declined, 3 approval expired
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
@@ -220,8 +222,10 @@ fn load_config(dir: &Path) -> Result<Config> {
 fn identity(name: Option<String>, existing: Option<&Config>) -> Result<(String, String)> {
     let device_name = match name {
         Some(n) => {
-            if !config::is_valid_alias(&n) {
-                bail!("device name `{n}` must match ^[a-z0-9][a-z0-9-]{{0,31}}$");
+            if !config::is_valid_device_name(&n) {
+                bail!(
+                    "device name `{n}`: 1-32 of a-z, 0-9 and -, starting and ending with a letter or digit"
+                );
             }
             n
         }

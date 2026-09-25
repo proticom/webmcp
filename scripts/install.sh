@@ -1,8 +1,8 @@
 #!/bin/sh
 # Install the webmcp daemon from its GitHub release.
-#   curl -fsSL https://webmcp.fast/install.sh | sh
+#   curl -fsSL https://github.com/proticom/webmcp/releases/latest/download/install.sh | sh
 # Environment: WEBMCP_VERSION (default: latest), WEBMCP_INSTALL_DIR (default: ~/.local/bin).
-# It downloads one tarball and its checksum over HTTPS, verifies the checksum,
+# It downloads one tarball and the release's SHA256SUMS over HTTPS, verifies the checksum,
 # and copies one binary. It never uses sudo and changes nothing else.
 set -eu
 
@@ -29,7 +29,7 @@ case "$(uname -s)" in
       say "    npm i -g @proticom/webmcp    (or: npx @proticom/webmcp up)"
       say "The release tarballs are unsigned and Gatekeeper will block them."
       say "To install one anyway (then: xattr -d com.apple.quarantine $DIR/webmcp):"
-      say "    curl -fsSL https://webmcp.fast/install.sh | WEBMCP_ALLOW_UNSIGNED=1 sh"
+      say "    curl -fsSL https://github.com/$REPO/releases/latest/download/install.sh | WEBMCP_ALLOW_UNSIGNED=1 sh"
       exit 0
     fi
     ;;
@@ -56,9 +56,10 @@ trap 'rm -rf "$tmp"' EXIT INT TERM
 
 say "Downloading $name"
 curl -fsSL "$base/$name.tar.gz" -o "$tmp/$name.tar.gz" || die "no release asset for $target at $VERSION"
-curl -fsSL "$base/$name.tar.gz.sha256" -o "$tmp/$name.tar.gz.sha256" || die "checksum file missing"
+curl -fsSL "$base/SHA256SUMS" -o "$tmp/SHA256SUMS" || die "SHA256SUMS missing from release $VERSION"
 
-want=$(cut -d' ' -f1 <"$tmp/$name.tar.gz.sha256")
+want=$(awk -v f="$name.tar.gz" '$2 == f || $2 == "*" f { print $1 }' "$tmp/SHA256SUMS")
+[ -n "$want" ] || die "no checksum for $name.tar.gz in SHA256SUMS"
 if command -v shasum >/dev/null 2>&1; then
   got=$(shasum -a 256 "$tmp/$name.tar.gz" | cut -d' ' -f1)
 elif command -v sha256sum >/dev/null 2>&1; then

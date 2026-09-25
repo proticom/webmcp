@@ -28,5 +28,6 @@
     "t": "mcp",
     "sid": "ses_0123456789abcdef",
     "msg": { "jsonrpc": "2.0", "id": 1, "method": "tools/list" }
-  }
+  },
+  { "t": "detach", "alias": "gnosys" }
 ]

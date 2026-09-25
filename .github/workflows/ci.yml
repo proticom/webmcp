@@ -46,6 +46,11 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: sh -n scripts/install.sh && shellcheck scripts/install.sh
+      - name: Install the latest release with this script
+        run: |
+          set -eu
+          WEBMCP_INSTALL_DIR="$RUNNER_TEMP/bin" sh scripts/install.sh
+          "$RUNNER_TEMP/bin/webmcp" --version
 
   # The npm distribution (npm/): manifests track Cargo.toml, the launcher
   # parses, and a real install resolves the platform package and runs the

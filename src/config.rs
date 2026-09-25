@@ -25,6 +25,12 @@ pub fn is_valid_alias(s: &str) -> bool {
     bytes[0] != b'-' && bytes.iter().all(ok)
 }
 
+/// Device names follow the gateway's rule: an alias that also ends in a
+/// letter or digit.
+pub fn is_valid_device_name(s: &str) -> bool {
+    is_valid_alias(s) && !s.ends_with('-')
+}
+
 /// Resolve the config directory.
 ///
 /// `$WEBMCP_CONFIG_DIR` wins. Otherwise: `~/Library/Application Support/webmcp/`
@@ -242,13 +248,34 @@ impl Config {
         }
     }
 
-    /// Write to `dir/config.toml` atomically.
+    /// Write to `dir/config.toml` atomically, readable by the owner only:
+    /// `env` values copied from other tools' configs can be API keys.
     pub fn save_to(&self, dir: &Path) -> Result<(), Error> {
         std::fs::create_dir_all(dir).map_err(|e| Error::io("create config dir", dir, e))?;
         let path = Self::path_in(dir);
         let tmp = dir.join(format!("{CONFIG_FILE}.tmp"));
         let text = toml::to_string_pretty(self).map_err(|e| Error::Corrupt(e.to_string()))?;
-        std::fs::write(&tmp, text).map_err(|e| Error::io("write config", &tmp, e))?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        {
+            use std::io::Write;
+            let mut f = opts
+                .open(&tmp)
+                .map_err(|e| Error::io("create config", &tmp, e))?;
+            f.write_all(text.as_bytes())
+                .map_err(|e| Error::io("write config", &tmp, e))?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| Error::io("chmod config", &tmp, e))?;
+        }
         std::fs::rename(&tmp, &path).map_err(|e| Error::io("rename config", &path, e))?;
         Ok(())
     }
@@ -303,6 +330,35 @@ mod tests {
         for bad in ["", "-a", "A", "a_b", "a b", &"a".repeat(33), "é"] {
             assert!(!is_valid_alias(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn device_name_must_end_in_letter_or_digit() {
+        for ok in ["a", "mac-studio", "box-01"] {
+            assert!(is_valid_device_name(ok), "{ok}");
+        }
+        for bad in ["mac-", "-mac", "", "Mac"] {
+            assert!(!is_valid_device_name(bad), "{bad}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(Config::path_in(dir.path()), "stale").unwrap();
+        std::fs::set_permissions(
+            Config::path_in(dir.path()),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        sample().save_to(dir.path()).unwrap();
+        let mode = std::fs::metadata(Config::path_in(dir.path()))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]

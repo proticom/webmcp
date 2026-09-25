@@ -15,7 +15,9 @@ valid for 10 minutes, single use.
 
 The daemon generates an Ed25519 keypair (private key never leaves the
 machine) and a hardware id: `sha256` of a stable machine identifier
-(`machine-uid`), hex encoded. It then calls:
+(`machine-uid`), hex encoded. A machine with no readable identifier gets a
+random 32-byte hex id instead, generated once and kept in the config so that
+pairing again sends the same one. It then calls:
 
 ```
 POST https://webmcp.fast/api/v1/pair
@@ -24,7 +26,7 @@ User-Agent: webmcp-daemon/<version> (<platform>)
 
 {
   "code": "ABCD-EFGH",            // dashes and case are ignored
-  "device_name": "macbook",        // 1-32 chars, [a-z0-9-], unique per handle
+  "device_name": "macbook",        // see name rules below; unique per handle
   "public_key": "<base64, 32 bytes>",
   "hardware_id": "<hex sha256>",
   "daemon_version": "0.1.0",
@@ -44,9 +46,17 @@ Responses:
 | 409 | `{"error":"hardware_already_paired"}` | This machine is already paired to another free handle. |
 | 429 | `{"error":"rate_limited"}` | Too many attempts from this IP. |
 
-The daemon stores `device_id`, `handle`, `relay_url`, `base_url` and the key
-in its config directory (`$XDG_CONFIG_HOME/webmcp/` or `~/.config/webmcp/`;
-`~/Library/Application Support/webmcp/` on macOS), key file mode `0600`.
+Name rules. A device name is 1-32 characters of `[a-z0-9-]`, starting and
+ending with a letter or digit. A handle is 3-32 characters of `[a-z0-9-]`,
+starting and ending with a letter or digit, with no two hyphens in a row. A
+server alias matches `^[a-z0-9][a-z0-9-]{0,31}$`.
+
+The daemon stores `device_id`, `handle`, `org_id`, `device_name`,
+`hardware_id`, `relay_url` and `base_url` in `config.toml` and the key in
+`device.key`, both mode `0600`, in its config directory
+(`$XDG_CONFIG_HOME/webmcp/` or `~/.config/webmcp/`;
+`~/Library/Application Support/webmcp/` on macOS;
+`%APPDATA%\webmcp\config` on Windows; `WEBMCP_CONFIG_DIR` overrides).
 
 ## 1a. Pairing without the dashboard: device authorization
 
@@ -99,8 +109,10 @@ GET wss://webmcp.fast/connect?device_id=dev_…
 User-Agent: webmcp-daemon/<version> (<platform>)
 ```
 
-The gateway rejects the upgrade with `404` if the device is unknown or
-revoked. After upgrade, the handshake is:
+The gateway rejects the upgrade with HTTP `404` if the device is unknown or
+revoked. The daemon treats that as final: it stops and tells the user to pair
+again (`webmcp up --force`) instead of reconnecting. After upgrade, the
+handshake is:
 
 ```
 daemon → {"t":"hello","v":1,"device_id":"dev_…","daemon_version":"0.1.0","platform":"macos-aarch64"}
@@ -128,13 +140,20 @@ pongs mean reconnect. Reconnect uses exponential backoff from 1 s to 60 s
 with jitter. Close codes `4401` and `4403` (revoked) mean stop and tell the
 user to pair again; do not retry.
 
+The gateway holds one socket per device. When a second connection for the
+same device authenticates, it replaces the first, which is closed with code
+`1012` and reason `replaced`. The daemon on the replaced connection exits
+instead of reconnecting, so two copies never take turns evicting each other.
+A `1012` with any other reason is a gateway restart and is retried like any
+other drop.
+
 ### Frames after `welcome`
 
 Implemented now:
 
 | Frame | Direction | Purpose |
 |---|---|---|
-| `{"t":"servers","servers":[{"alias":"gnosys","transport":"stdio"\|"http","mode":"per-session"\|"shared"\|"exclusive","status":"ready"\|"error","error":"…"?}]}` | daemon → gateway | Sent on connect and whenever the attached set changes. |
+| `{"t":"servers","servers":[{"alias":"gnosys","transport":"stdio"\|"http","mode":"per-session"\|"shared"\|"exclusive","status":"ready"\|"error","error":"…"?}]}` | daemon → gateway | Sent on connect and whenever the attached set changes. The gateway keeps only the first 200 entries. |
 | `{"t":"error","code":"…","message":"…"?}` | either | Non-fatal unless followed by close. |
 
 MCP relay (the daemon must still ignore unknown `t` values):
@@ -172,12 +191,12 @@ per-session process; the gateway forgets the sessions, and the harness gets
 
 The gateway may send `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":…,"reason":…}}`
 inside an `mcp` frame when the harness disconnects mid-call or the call
-passes the 60 s relay ceiling. It is an ordinary MCP notification and is
+passes the relay ceiling (30 minutes streamed, 5 minutes as a JSON response). It is an ordinary MCP notification and is
 passed to the server like any other.
 
-Sizes: an `mcp` frame to the daemon over 1 MB closes that session; a frame
-from the daemon may be up to 8 MB; the daemon drops the connection on any
-WebSocket message over 4 MB inbound.
+Sizes: an `mcp` frame to the daemon over 1 MiB closes that session; a frame
+from the daemon may be up to 8 MiB; the daemon drops the connection on any
+WebSocket message over 4 MiB inbound.
 
 ### Who decides what is exposed
 
@@ -232,7 +251,9 @@ the signed-in user manages that handle, and the device exists. The grant is
 bound to that one URL: the access token's audience must equal the request's
 URL, and the grant's encrypted props must name the same handle, device id and
 server. PKCE S256 is mandatory for public clients. Access tokens last 1 hour.
-Re-authorizing the same client for the same endpoint replaces its grant; the
+Refresh tokens rotate on every use and do not expire. A grant ends only when
+the owner disconnects it on the dashboard, or removes the server or the
+device. Re-authorizing the same client for the same endpoint replaces its grant; the
 same client may hold grants for other endpoints. A grant counts as one
 connector against the plan. Disconnecting on the dashboard revokes the grant
 and ends its sessions (`token_revoked`).
@@ -249,14 +270,16 @@ one handle, one device (by id, so it dies with the device) and one server alias.
 | `POST` `initialize`, no `Mcp-Session-Id` | Opens a session on the device. Response is `application/json` with the `Mcp-Session-Id` header. `503` + JSON-RPC error if the device is offline or the server is not ready; `404` if no such server is attached; `403` if it is not enabled on the dashboard. |
 | `POST` request with `Mcp-Session-Id` | Relayed. If the client accepts `text/event-stream` the response is an SSE stream carrying any server notifications or server-to-client requests that arrive during the call, then the response, then it closes. Otherwise a single `application/json` response. |
 | `POST` notification or response | Relayed; `202`. |
-| `GET` with `Mcp-Session-Id` | SSE stream for server-initiated messages outside any call. One per session; a new one replaces the old. Not resumable. |
+| `GET` with `Mcp-Session-Id` | SSE stream for server-initiated messages outside any call. One per session; a new one replaces the old. Not resumable. Without `Accept: text/event-stream` it gets `406`. |
 | `DELETE` with `Mcp-Session-Id` | Ends the session; `204`. |
 
 Server-initiated messages ride the newest in-flight call's stream, else the
 `GET` stream. If neither exists, notifications are dropped and requests are
 answered to the server with a JSON-RPC error. An unknown, expired or
-foreign `Mcp-Session-Id` gets `404`. JSON-RPC batches are refused (`400`).
-Limits: 1 MB per request body, 60 s per relayed call. Relay-generated
+foreign `Mcp-Session-Id` gets `404`. JSON-RPC batches are refused (`400`). A
+request whose JSON-RPC `id` matches one still in flight on the same session
+is refused with `400`.
+Limits: 1 MB per request body; a relayed call may run 30 minutes when the response is streamed (SSE pings every 20 s keep it alive) or 5 minutes as a single JSON response. Cloudflare itself imposes no wall-clock limit while the client stays connected. Work longer than that belongs in the server as a job it reports on. Relay-generated
 JSON-RPC errors use code `-32001`.
 
 Not implemented yet: the legacy HTTP+SSE transport (`/sse` + `/messages`),
@@ -283,4 +306,3 @@ tools need no account. The two that do answer `401` with
 The OAuth `resource` is `https://webmcp.fast/mcp`. A `manage` grant is not a
 connector: it opens no tenant endpoint, does not count against the plan, and is
 listed under *Setup agents* on the dashboard with Disconnect.
-
