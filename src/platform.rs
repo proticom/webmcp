@@ -96,7 +96,7 @@ mod tests {
     fn platform_shape() {
         let p = platform();
         assert!(p.contains('-'));
-        assert!(user_agent().starts_with("webmcp-daemon/0.1.0 ("));
+        assert!(user_agent().starts_with(&format!("webmcp-daemon/{} (", env!("CARGO_PKG_VERSION"))));
         assert_eq!(random_hardware_id().len(), 64);
     }
 }
