@@ -13,7 +13,8 @@ or, without installing:
     npx @proticom/webmcp up
 
 `webmcp up` pairs this machine, offers the MCP servers your other tools already
-use, installs the background service, and prints each server's URL.
+use, offers to install the background service (macOS, Linux), and prints each
+server's URL.
 
 Packages are published from GitHub Actions with provenance attestations;
 verify with `npm audit signatures`. Full documentation, protocol, threat model

@@ -55,7 +55,7 @@ pub fn persist(
         handle: resp.handle,
         device_name: resp
             .device_name
-            .filter(|n| config::is_valid_alias(n))
+            .filter(|n| config::is_valid_device_name(n))
             .unwrap_or(requested_name),
         org_id: resp.org_id,
         base_url: resp.base_url,

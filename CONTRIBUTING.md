@@ -12,7 +12,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-Tests never touch your real config, keychain or launchd; they use temp
+Tests never touch your real config, key file, launchd or systemd; they use temp
 directories and in-process mock gateways. Please keep it that way.
 
 ## Changes

@@ -25,7 +25,8 @@ closed source; report issues with it the same way.
   (`@proticom/webmcp` and its platform packages) are published through OIDC
   trusted publishing with provenance attestations, so `npm audit signatures`
   can tie what you installed to the release workflow and commit; no long-lived
-  npm token exists. The GitHub release tarballs ship with SHA-256 checksums.
+  npm token exists. The GitHub release tarballs and Windows zip ship with SHA-256 checksums
+  (`SHA256SUMS`).
   Binaries are not code-signed or notarized on any platform.
 - CI runs `cargo audit` against the RustSec advisory database on every change.
 - Dependabot watches Cargo and GitHub Actions dependencies.

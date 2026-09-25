@@ -37,9 +37,9 @@ path for a brand-new name, so use the standard workaround:
 
 1. From your own machine, logged in as the `proticom` org owner with 2FA
    (`npm login`), publish a placeholder `0.0.0` of each of the six names.
-   The placeholder needs only a `package.json` (name, version, license,
-   `"private": false`) and a one-line README; for the platform packages keep
-   the `os`/`cpu` fields so the placeholder is never installed by mistake.
+   `scripts/npm-bootstrap.sh` does this: each placeholder is a `package.json`
+   (name, `0.0.0`, description, license, repository, homepage) and a one-line
+   README, with no binary and no `bin`, so installing one does nothing.
    Publish with `npm publish --access public` (scoped packages are private by
    default). Do **not** publish a real version this way: the real versions
    must carry provenance from the workflow.

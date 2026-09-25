@@ -24,11 +24,13 @@ on) picked by npm. Every package is published from GitHub Actions with a
 provenance attestation: `npm audit signatures` verifies that what you
 installed was built by the release workflow in this repository.
 
-Linux, without Node: the GitHub release has one tarball and SHA-256 checksum
-per target ([releases](https://github.com/proticom/webmcp/releases)), and
-`scripts/install.sh` downloads, verifies and copies one binary to `~/.local/bin`:
+Linux, without Node: the GitHub release has one tarball per target and a
+single `SHA256SUMS` file ([releases](https://github.com/proticom/webmcp/releases)).
+`scripts/install.sh`, attached to every release, downloads one tarball, checks
+it against `SHA256SUMS` and copies the binary to `~/.local/bin`
+(`WEBMCP_INSTALL_DIR` changes that, `WEBMCP_VERSION=v0.1.0` pins a release):
 
-    curl -fsSL https://webmcp.fast/install.sh | sh
+    curl -fsSL https://github.com/proticom/webmcp/releases/latest/download/install.sh | sh
 
 Read it first. On macOS the script points you at npm instead, because the
 tarballs are not code-signed (there is no Apple Developer ID) and Gatekeeper
@@ -44,14 +46,14 @@ Windows gets a `.zip` on the release page. Or build from source (Rust 1.94+):
 
 One command, safe to run again at any point. It does only what is still missing:
 
-1. **Pairs** this machine. It prints a link (and tries to open it in your browser): sign in with the
+1. **Pairs** this machine. It prints a link (and on macOS and Linux tries to open it in your browser): sign in with the
    emailed code, which creates the account if you have none, pick a handle, approve the device. The
    login code never passes through the daemon. `--name laptop`, `--base-url URL`, `--no-browser`;
    `--force` pairs again after a revoke (attached servers are kept).
 2. **Offers the MCP servers this machine already has**, found read-only in the configs of Claude Code
    (`~/.claude.json`, `./.mcp.json`), Claude Desktop, Cursor (`~/.cursor/mcp.json`, `./.cursor/mcp.json`),
    Codex CLI (`~/.codex/config.toml`) and VS Code (`./.vscode/mcp.json`). At a terminal you pick by
-   number; `--attach <name>` (repeatable) attaches without asking; `--no-attach` skips. Nothing is ever
+   number, and only while nothing is attached yet; `--attach <name>` (repeatable) attaches without asking; `--no-attach` skips. Nothing is ever
    attached without one of those. Attaching a stdio server **copies its env variables, values included,
    into the webmcp config** (that is how the server gets its API keys); the output names the variables,
    never the values. Remote-URL entries are listed as "remote, not attachable". `webmcp discover`
@@ -77,7 +79,8 @@ stderr, and nothing ever prompts. `up` is the one two-line case: if it has to pa
 
 `service` is `installed`, `skipped` or `unsupported`; `env_carried` (names only) appears on servers this
 run attached. On failure `event` is `error` with `code` (`access_denied`, `expired_token`, `device_limit`,
-`device_name_taken`, `hardware_already_paired`, `rate_limited`, `invalid_request`, `network`, or `error`)
+`device_name_taken`, `hardware_already_paired`, `rate_limited`, `invalid_request`, `unexpected_response`,
+`network`, or `error`)
 and `message`; `handle`/`device` are null if it failed before pairing. Any other command fails as
 `{"event":"error","code":"error","message":"…"}`. Exit codes: `0` ok, `1` error, `2` approval declined,
 `3` approval expired. `webmcp discover --json` gives
@@ -86,7 +89,7 @@ and `message`; `handle`/`device` are null if it failed before pairing. Any other
 
 ## Manual commands
 
-    webmcp login --code ABCD-EFGH [--name laptop] [--base-url https://webmcp.fast]   # pair with a dashboard code
+    webmcp login --code ABCD-EFGH [--name laptop] [--base-url https://webmcp.fast] [--force]   # pair with a dashboard code
     webmcp connect [--once]                # keep the relay open; --once = handshake + one ping/pong
     webmcp status                          # config path, handle, device id, key fingerprint
     webmcp discover                        # MCP servers found in other tools' configs (read-only)
@@ -99,20 +102,24 @@ and `message`; `handle`/`device` are null if it failed before pairing. Any other
 Only one `webmcp connect` runs per device: it holds a lock (`daemon.lock` in the config directory) and a
 second one exits naming the first one's pid. If another machine connects with a copy of this identity,
 the gateway closes this connection with `1012 "replaced"` and the daemon stops instead of fighting for
-the socket (under the background service it exits cleanly, so launchd does not restart it).
+the socket (under the background service it exits cleanly, so launchd or systemd does not restart it).
 
 Config lives in `~/.config/webmcp/` (`$XDG_CONFIG_HOME`, or `~/Library/Application Support/webmcp/`
-on macOS; override with `WEBMCP_CONFIG_DIR`): `config.toml` plus the Ed25519 seed in `device.key` (0600).
+on macOS, `%APPDATA%\webmcp\config` on Windows; override with `WEBMCP_CONFIG_DIR`): `config.toml` and the
+Ed25519 seed in `device.key`, both written 0600 because `config.toml` can hold copied API keys.
 Logs go to stderr; set `RUST_LOG=debug` for frame-level detail. `webmcp connect` serves the
 attached servers: a stdio server is spawned once per MCP session (`exclusive`: one session at a time) and
 killed when the session closes, idles for 30 min or the relay connection drops; an `--http` server is
-reached as an MCP Streamable HTTP client. `--mode shared` over stdio is not supported yet.
+reached as an MCP Streamable HTTP client; for it `--mode` is recorded only, and `--max-sessions` still
+applies. `--mode shared` over stdio is not supported yet. Device names follow the gateway's rule: 1-32 of
+`a-z`, `0-9` and `-`, starting and ending with a letter or digit.
 
 `attach` and `detach` take effect on a running `webmcp connect` within a couple of seconds, no restart:
 it polls `config.toml` and re-advertises the server list. Sessions on a detached alias end with
 `detached`, sessions on an alias whose definition changed end with `reconfigured` (the next session uses
 the new one), everything else keeps running. A config that does not parse is ignored until it does.
-Only `servers` is reloaded; after `webmcp login --force`, restart `webmcp connect`.
+Only `servers` is reloaded; after re-pairing (`webmcp up --force` or `webmcp login --force`), restart
+`webmcp connect`.
 
 ## Running in the background (macOS, Linux)
 

@@ -87,7 +87,7 @@ mod tests {
         assert_eq!(long.len(), 32);
         let dash_at_cut = sanitize_device_name(&format!("{}-{}", "a".repeat(31), "b".repeat(10)));
         assert_eq!(dash_at_cut, "a".repeat(31));
-        assert!(crate::config::is_valid_alias(&sanitize_device_name(
+        assert!(crate::config::is_valid_device_name(&sanitize_device_name(
             "Some Host"
         )));
     }
