@@ -1,6 +1,6 @@
 # Releasing
 
-**One-time setup:** run `scripts/npm-bootstrap.sh` while logged in to npm. It publishes the six placeholder names and adds the GitHub Actions trusted publisher to each with `npm trust github`, so the manual steps below are only a fallback.
+**One-time setup (done for v0.1.0 on 2026-09-25):** `scripts/npm-bootstrap.sh` publishes the six placeholder names and tries `npm trust github` on each. That command needs a browser 2FA approval per package and times out with `E404 .../-/v1/done` if nobody approves within about 5 minutes. The npmjs.com form below is the path that worked.
 
 A release is one git tag. Pushing `vX.Y.Z` runs `.github/workflows/release.yml`,
 which builds five binaries, creates the GitHub release (tarballs, a Windows
@@ -49,6 +49,10 @@ path for a brand-new name, so use the standard workaround:
    - Repository: `webmcp`
    - Workflow filename: `release.yml`
    - Environment name: `release`
+   - Label: `proticom/webmcp release`
+   - Tick **Allow `npm publish`**. Unticked, the connection only permits
+     `npm stage publish` and the workflow's `npm publish` fails. The
+     connection cannot be edited after it is created.
 3. Still in each package's settings, under "Publishing access", select
    "Require two-factor authentication and disallow tokens". The docs
    "strongly recommend restricting traditional token-based publishing access"
