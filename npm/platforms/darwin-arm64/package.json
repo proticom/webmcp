@@ -1,6 +1,6 @@
 {
   "name": "@proticom/webmcp-darwin-arm64",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Prebuilt webmcp binary for darwin arm64. Installed automatically by @proticom/webmcp; do not depend on it directly.",
   "license": "Apache-2.0",
   "repository": {
