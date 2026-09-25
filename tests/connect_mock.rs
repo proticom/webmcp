@@ -268,7 +268,7 @@ async fn connect_once_succeeds_with_correct_key() {
                 assert!(user_agent
                     .as_deref()
                     .unwrap_or("")
-                    .starts_with("webmcp-daemon/0.1.0 ("));
+                    .starts_with(&format!("webmcp-daemon/{} (", env!("CARGO_PKG_VERSION"))));
                 saw.0 = true;
             }
             Event::Hello(Frame::Hello {
@@ -276,7 +276,7 @@ async fn connect_once_succeeds_with_correct_key() {
                 platform,
                 ..
             }) => {
-                assert_eq!(daemon_version, "0.1.0");
+                assert_eq!(daemon_version, env!("CARGO_PKG_VERSION"));
                 assert!(platform.contains('-'));
                 saw.1 = true;
             }
