@@ -176,7 +176,10 @@ daemon answers with `session_close`, and the gateway fails the pending
 `initialize` with a JSON-RPC error carrying the reason.
 
 `session_close` reasons. From the daemon: `unknown_server`, `busy`
-(exclusive server already held), `too_many_sessions`, `unsupported_mode`,
+(exclusive server already held), `too_many_sessions` (every session on the
+server has a request in flight), `evicted` (the least recently used idle
+session on a server at its session cap, closed to admit a new one; its client
+gets `404` and initializes again), `unsupported_mode`,
 `spawn_failed: <detail>`, `server_exited`, `idle`, `message_too_large`,
 `overloaded` (its 256-message session queue filled), `duplicate_session`,
 and `unknown_session` (an `mcp` frame for a `sid` it does not hold, which

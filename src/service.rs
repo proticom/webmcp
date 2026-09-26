@@ -349,9 +349,42 @@ pub fn status(home: &Path) -> Result<ServiceStatus, Error> {
     Ok(ServiceStatus { installed, pid })
 }
 
+/// The Node version manager whose per-version directory holds `program`, if
+/// any. A service pinned there breaks when the user switches Node versions.
+pub fn node_version_manager(program: &Path) -> Option<&'static str> {
+    let p = program.to_string_lossy().replace('\\', "/");
+    [
+        ("/.nvm/versions/", "nvm"),
+        ("/fnm_multishells/", "fnm"),
+        ("/.local/share/fnm/", "fnm"),
+        ("/.asdf/installs/", "asdf"),
+        ("/.volta/tools/image/", "Volta"),
+        ("/n/versions/", "n"),
+    ]
+    .into_iter()
+    .find(|(needle, _)| p.contains(needle))
+    .map(|(_, name)| name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spots_node_version_manager_paths() {
+        let nvm = Path::new("/Users/x/.nvm/versions/node/v22.17.1/lib/node_modules/@proticom/webmcp-darwin-arm64/webmcp");
+        assert_eq!(node_version_manager(nvm), Some("nvm"));
+        assert_eq!(
+            node_version_manager(Path::new(
+                "/opt/homebrew/lib/node_modules/@proticom/webmcp-darwin-arm64/webmcp"
+            )),
+            None
+        );
+        assert_eq!(
+            node_version_manager(Path::new("/Users/x/.local/bin/webmcp")),
+            None
+        );
+    }
 
     fn spec() -> ServiceSpec {
         ServiceSpec {

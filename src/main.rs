@@ -773,6 +773,12 @@ fn install_service(home: PathBuf) -> Result<(PathBuf, PathBuf)> {
         home,
     };
     let definition = service::install(&spec)?;
+    if let Some(manager) = service::node_version_manager(&spec.program) {
+        eprintln!(
+            "note: this webmcp binary lives inside {manager}'s per-version Node directory. \
+             After switching Node versions, reinstall webmcp and run `webmcp service install` again."
+        );
+    }
     Ok((definition, spec.log_file))
 }
 

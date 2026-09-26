@@ -235,6 +235,8 @@ while IFS= read -r line; do
       printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
     *'"test/exit"'*)
       exit 3 ;;
+    *'"test/hang"'*)
+      ;;
     *'"id"'*)
       echo "this line is not json"
       printf '{"jsonrpc":"2.0","id":%s,"result":{"echo":%s}}\n' "$id" "$line" ;;
@@ -467,9 +469,51 @@ async fn refusals_unknown_busy_limit_unsupported_and_spawn_failure() {
     gw.mcp("ses_3", initialize(7));
     assert_eq!(gw.recv_mcp("ses_3").await["id"], 7);
 
+    // At the cap, a session with a request still running is never evicted.
     gw.open("ses_l1", "limited");
+    gw.mcp("ses_l1", initialize(1));
+    assert_eq!(gw.recv_mcp("ses_l1").await["id"], 1);
+    gw.mcp(
+        "ses_l1",
+        json!({"jsonrpc":"2.0","id":2,"method":"test/hang"}),
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
     gw.open("ses_l2", "limited");
     assert_eq!(gw.recv_close("ses_l2").await, "too_many_sessions");
+}
+
+#[tokio::test]
+async fn at_the_cap_the_least_recently_used_idle_session_is_evicted() {
+    let fake = FakeServer::new();
+    let mut fs = fake.entry("fs", SessionMode::PerSession);
+    fs.max_sessions = Some(2);
+    let (mut gw, _daemon) = start(vec![fs], |_| {}).await;
+
+    gw.open("ses_a", "fs");
+    gw.mcp("ses_a", initialize(1));
+    assert_eq!(gw.recv_mcp("ses_a").await["id"], 1);
+    gw.open("ses_b", "fs");
+    gw.mcp("ses_b", initialize(2));
+    assert_eq!(gw.recv_mcp("ses_b").await["id"], 2);
+    let pids = fake.pids(2).await;
+    // ses_a is used again, so ses_b is now the least recently used.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    gw.mcp(
+        "ses_a",
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}),
+    );
+    assert_eq!(gw.recv_mcp("ses_a").await["id"], 3);
+
+    gw.open("ses_c", "fs");
+    assert_eq!(gw.recv_close("ses_b").await, "evicted");
+    assert_dies(pids[1]).await;
+    gw.mcp("ses_c", initialize(4));
+    assert_eq!(gw.recv_mcp("ses_c").await["id"], 4);
+    gw.mcp(
+        "ses_a",
+        json!({"jsonrpc":"2.0","id":5,"method":"tools/list"}),
+    );
+    assert_eq!(gw.recv_mcp("ses_a").await["id"], 5);
 }
 
 #[tokio::test]

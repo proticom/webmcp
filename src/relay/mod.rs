@@ -10,8 +10,9 @@ mod sse;
 mod stdio;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
@@ -42,6 +43,9 @@ pub mod reason {
     pub const DUPLICATE_SESSION: &str = "duplicate_session";
     pub const BUSY: &str = "busy";
     pub const TOO_MANY_SESSIONS: &str = "too_many_sessions";
+    /// Closed to make room for a new session: it was the least recently
+    /// used one on its server with no request in flight.
+    pub const EVICTED: &str = "evicted";
     pub const UNSUPPORTED_MODE: &str = "unsupported_mode";
     pub const SERVER_EXITED: &str = "server_exited";
     pub const IDLE: &str = "idle";
@@ -72,6 +76,53 @@ impl Default for RelayOptions {
     }
 }
 
+/// Traffic bookkeeping that picks which session to evict at the cap.
+#[derive(Debug)]
+struct Activity {
+    last: Mutex<Instant>,
+    /// JSON-RPC requests sent to the backend and not yet answered.
+    in_flight: AtomicUsize,
+}
+
+impl Activity {
+    fn new() -> Self {
+        Activity {
+            last: Mutex::new(Instant::now()),
+            in_flight: AtomicUsize::new(0),
+        }
+    }
+
+    fn touch(&self) {
+        *self.last.lock().expect("activity lock") = Instant::now();
+    }
+
+    fn last(&self) -> Instant {
+        *self.last.lock().expect("activity lock")
+    }
+
+    /// A message from the gateway: a request (method and id) is now in flight.
+    fn note_to_backend(&self, msg: &Value) {
+        self.touch();
+        if msg.get("method").is_some() && msg.get("id").is_some() {
+            self.in_flight.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A message from the backend: a response (id, no method) settles one.
+    fn note_from_backend(&self, msg: &Value) {
+        self.touch();
+        if msg.get("method").is_none() && msg.get("id").is_some() {
+            let _ = self
+                .in_flight
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+        }
+    }
+
+    fn idle(&self) -> bool {
+        self.in_flight.load(Ordering::Relaxed) == 0
+    }
+}
+
 /// What a backend task needs to talk back to the gateway.
 #[derive(Clone)]
 pub(crate) struct SessionCtx {
@@ -79,12 +130,14 @@ pub(crate) struct SessionCtx {
     pub alias: String,
     pub idle_timeout: Duration,
     out: mpsc::Sender<Message>,
+    activity: Arc<Activity>,
 }
 
 impl SessionCtx {
     /// Send one backend message to the gateway as an `mcp` frame. `false`
     /// means the connection is gone and the session should stop.
     pub async fn emit(&self, msg: Value) -> bool {
+        self.activity.note_from_backend(&msg);
         let frame = Frame::Mcp {
             sid: self.sid.clone(),
             msg,
@@ -102,6 +155,7 @@ struct SessionHandle {
     /// Dropping it is the close signal, seen even while `tx` is backed up.
     cancel: oneshot::Sender<()>,
     task: JoinHandle<()>,
+    activity: Arc<Activity>,
 }
 
 type Sessions = Arc<Mutex<HashMap<String, SessionHandle>>>;
@@ -175,8 +229,16 @@ impl Relay {
             return;
         }
         if live >= entry.max_sessions.unwrap_or(self.opts.max_sessions) {
-            self.refuse(&sid, reason::TOO_MANY_SESSIONS).await;
-            return;
+            // Clients rarely close sessions, so at the cap the least recently
+            // used idle one makes room; its client gets a 404 and starts a new
+            // session, as MCP Streamable HTTP expects.
+            let Some((victim, handle)) = self.evictable(&server) else {
+                self.refuse(&sid, reason::TOO_MANY_SESSIONS).await;
+                return;
+            };
+            info!(sid = %victim, %server, "session evicted to make room");
+            stop(handle).await;
+            self.refuse(&victim, reason::EVICTED).await;
         }
 
         let client_name = client
@@ -189,11 +251,13 @@ impl Relay {
         let id = self.next_id;
         let (tx, rx) = mpsc::channel(SESSION_QUEUE);
         let (cancel, cancelled) = oneshot::channel();
+        let activity = Arc::new(Activity::new());
         let ctx = SessionCtx {
             sid: sid.clone(),
             alias: server.clone(),
             idle_timeout: self.opts.idle_timeout,
             out: self.out.clone(),
+            activity: activity.clone(),
         };
         let sessions = self.sessions.clone();
         let http = self.http.clone();
@@ -229,15 +293,31 @@ impl Relay {
                 tx,
                 cancel,
                 task,
+                activity,
             },
         );
+    }
+
+    /// Remove and return the least recently used session on `server` with no
+    /// request in flight.
+    fn evictable(&self, server: &str) -> Option<(String, SessionHandle)> {
+        let mut sessions = self.sessions.lock().expect("sessions lock");
+        let sid = sessions
+            .iter()
+            .filter(|(_, s)| s.alias == server && s.activity.idle())
+            .min_by_key(|(_, s)| s.activity.last())
+            .map(|(sid, _)| sid.clone())?;
+        sessions.remove(&sid).map(|h| (sid, h))
     }
 
     /// `mcp`: queue one message for the session's backend.
     pub async fn deliver(&mut self, sid: String, msg: Value) {
         let queued = {
             let sessions = self.sessions.lock().expect("sessions lock");
-            sessions.get(&sid).map(|s| s.tx.try_send(msg))
+            sessions.get(&sid).map(|s| {
+                s.activity.note_to_backend(&msg);
+                s.tx.try_send(msg)
+            })
         };
         match queued {
             Some(Ok(())) => {}
