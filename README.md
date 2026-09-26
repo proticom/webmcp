@@ -109,7 +109,9 @@ on macOS, `%APPDATA%\webmcp\config` on Windows; override with `WEBMCP_CONFIG_DIR
 Ed25519 seed in `device.key`, both written 0600 because `config.toml` can hold copied API keys.
 Logs go to stderr; set `RUST_LOG=debug` for frame-level detail. `webmcp connect` serves the
 attached servers: a stdio server is spawned once per MCP session (`exclusive`: one session at a time) and
-killed when the session closes, idles for 30 min or the relay connection drops; an `--http` server is
+killed when the session closes, idles for 30 min or the relay connection drops. At the cap
+(`--max-sessions`, default 4) the least recently used session with no request running is closed to
+make room, and its client starts a new one; only when every session is busy is a new one refused; an `--http` server is
 reached as an MCP Streamable HTTP client; for it `--mode` is recorded only, and `--max-sessions` still
 applies. `--mode shared` over stdio is not supported yet. Device names follow the gateway's rule: 1-32 of
 `a-z`, `0-9` and `-`, starting and ending with a letter or digit.
@@ -134,6 +136,9 @@ no sudo) that runs `webmcp connect`; logs go to `~/Library/Logs/webmcp/daemon.lo
 On Linux it writes a systemd user unit (`~/.config/systemd/user/webmcp.service`,
 `Restart=on-failure`, no sudo) and runs `systemctl --user daemon-reload && enable
 && restart`; logs go to `~/.local/state/webmcp/daemon.log` (and `journalctl --user -u webmcp`).
+The service runs the binary it was installed from. If that binary lives inside a Node version
+manager (nvm, fnm, asdf, Volta, n), switching Node versions removes it: reinstall webmcp and run
+`webmcp service install` again. `service install` prints a note when this applies.
 A user unit only runs while you have a session; `loginctl enable-linger $USER`
 keeps it up after logout and across reboots. Both record your shell's `PATH` at
 install time, because stdio servers are usually launched through `npx`, `uvx` or a
