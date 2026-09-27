@@ -56,6 +56,7 @@ impl Gateway {
                 version: Some("1.0".into()),
                 extra: Default::default(),
             }),
+            credential: None,
         });
     }
 
@@ -209,7 +210,7 @@ async fn start(
     }));
     // Every connection starts with the `servers` frame.
     match gw.recv().await {
-        Frame::Servers { servers } => assert_eq!(servers.len(), entries.len()),
+        Frame::Servers { servers, .. } => assert_eq!(servers.len(), entries.len()),
         other => panic!("expected servers, got {other:?}"),
     }
     (gw, daemon)
@@ -431,7 +432,7 @@ async fn refusals_unknown_busy_limit_unsupported_and_spawn_failure() {
         let _ = connect::run(&opts).await;
     }));
     // Shared stdio is advertised as an error, everything else as ready.
-    let Frame::Servers { servers } = gw.recv().await else {
+    let Frame::Servers { servers, .. } = gw.recv().await else {
         panic!("expected servers");
     };
     for s in &servers {
@@ -875,7 +876,7 @@ impl Gateway {
     /// Next frame must be `servers`; returns the advertised aliases.
     async fn recv_servers(&mut self) -> Vec<String> {
         match self.recv().await {
-            Frame::Servers { servers } => servers.into_iter().map(|s| s.alias).collect(),
+            Frame::Servers { servers, .. } => servers.into_iter().map(|s| s.alias).collect(),
             other => panic!("expected servers, got {other:?}"),
         }
     }
@@ -921,7 +922,7 @@ async fn reload_adds_an_alias_without_touching_sessions_and_survives_reconnect()
     // A reconnect advertises the reloaded set, not the startup one.
     gw.cmd.send(Cmd::Drop).unwrap();
     assert_dies(pid).await;
-    let Frame::Servers { servers } = gw.recv().await else {
+    let Frame::Servers { servers, .. } = gw.recv().await else {
         panic!("expected servers");
     };
     assert_eq!(servers.len(), 2);

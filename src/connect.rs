@@ -309,6 +309,7 @@ async fn advertise(
 ) -> Result<bool, ConnectError> {
     let servers = Frame::Servers {
         servers: watcher.infos().to_vec(),
+        require_approval: false,
     };
     Ok(out.send(Message::text(servers.to_json()?)).await.is_ok())
 }
@@ -499,6 +500,7 @@ async fn handle_frame(frame: Frame, relay: &mut Relay, opts: &ConnectOptions) {
             sid,
             server,
             client,
+            ..
         } => relay.open(sid, server, client).await,
         Frame::SessionClose { sid, reason } => relay.close(&sid, reason.as_deref()).await,
         Frame::Mcp { sid, msg } => relay.deliver(sid, msg).await,

@@ -206,7 +206,7 @@ async fn serve(
                 ws.send(Message::text(PONG)).await.unwrap();
             }
             Message::Text(t) => {
-                if let Ok(Frame::Servers { servers }) = Frame::from_json(t.as_str()) {
+                if let Ok(Frame::Servers { servers, .. }) = Frame::from_json(t.as_str()) {
                     let _ = tx.send(Event::Servers(servers));
                 }
             }

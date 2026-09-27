@@ -16,6 +16,11 @@
     "t": "servers",
     "servers": [{ "alias": "gnosys", "transport": "http", "mode": "shared", "status": "ready" }]
   },
+  {
+    "t": "servers",
+    "servers": [{ "alias": "fs", "transport": "stdio", "mode": "per-session", "status": "ready" }],
+    "require_approval": true
+  },
   { "t": "error", "code": "unauthorized" },
   {
     "t": "session_open",
@@ -23,7 +28,15 @@
     "server": "gnosys",
     "client": { "name": "claude", "version": "1.0" }
   },
+  {
+    "t": "session_open",
+    "sid": "ses_fedcba9876543210",
+    "server": "fs",
+    "client": { "name": "claude-ai", "version": "0.1.0" },
+    "credential": { "id": "grt_0123456789abcdef", "kind": "oauth", "name": "Claude" }
+  },
   { "t": "session_close", "sid": "ses_0123456789abcdef", "reason": "client_disconnected" },
+  { "t": "session_close", "sid": "ses_fedcba9876543210", "reason": "approval_required" },
   {
     "t": "mcp",
     "sid": "ses_0123456789abcdef",
