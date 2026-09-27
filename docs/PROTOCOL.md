@@ -103,6 +103,47 @@ key: a different machine that learns the `user_code` gains nothing. If the
 human chose a different device name on the approval page, the `200` body's
 `device_name` is authoritative. Polling starts after one full `interval`.
 
+## 1b. Adding a passkey from the device
+
+Once an account has a paired device, its first passkey, and any passkey added
+without an existing one (recovery), must be started from that device. The
+daemon proves it holds the device key (`webmcp passkey`):
+
+```
+POST https://webmcp.fast/api/v1/device/passkey-link
+Content-Type: application/json
+User-Agent: webmcp-daemon/<version> (<platform>)
+
+{ "device_id": "dev_…", "ts": 1790000000, "signature": "<base64, 64 bytes>" }
+```
+
+`ts` is the daemon's clock in Unix seconds, a JSON number. The signature is
+Ed25519, made with the device key, over the UTF-8 bytes of:
+
+```
+"webmcp-passkey-link-v1\n" + device_id + "\n" + ts
+```
+
+where `ts` is written in decimal exactly as sent. The gateway rejects a `ts`
+more than 300 s away from its own clock, either way.
+
+| Status | Body | Meaning |
+|---|---|---|
+| 201 | `{"url":"https://…","expires_in":600}` | Open `url` in a browser within `expires_in` seconds. |
+| 400 | `{"error":"invalid_request","message":"…"}` | Malformed body. |
+| 401 | `{"error":"bad_signature"}` | The signature does not verify against the device's public key. |
+| 401 | `{"error":"clock_skew"}` | `ts` is more than 300 s off. |
+| 404 | `{"error":"unknown_device"}` | Unknown or revoked device. |
+| 429 | `{"error":"rate_limited"}` | Too many links asked for. |
+
+Every error body may carry a `message`. The daemon reports the `error` code
+whatever the status, and treats a `429` without a JSON body as
+`rate_limited`.
+
+The link works once, for 10 minutes, and only for a signed-in user who can
+manage that device's handle. It lets that browser add a passkey without an
+existing one.
+
 ## 2. Relay connection
 
 ```

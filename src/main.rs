@@ -16,6 +16,7 @@ use webmcp_daemon::discover::{self, Discovered, Roots};
 use webmcp_daemon::lock::{InstanceLock, LockError};
 use webmcp_daemon::output::{self, ServiceOutcome, UpEvent, UpReport};
 use webmcp_daemon::pair::{self, PairError, PairRequest};
+use webmcp_daemon::passkey::{self, PasskeyError};
 use webmcp_daemon::proto::SessionMode;
 use webmcp_daemon::{approvals, keys, platform, service, Error};
 
@@ -30,8 +31,8 @@ const DEFAULT_BASE_URL: &str = "https://webmcp.fast";
 )]
 struct Cli {
     /// Machine-readable output for up, discover, status, servers, attach,
-    /// detach, approvals, approve and service status: one JSON object on
-    /// stdout (logs stay on stderr), and nothing ever prompts. `up` prints one
+    /// detach, approvals, approve, passkey and service status: one JSON
+    /// object on stdout (logs stay on stderr), and nothing ever prompts. `up` prints one
     /// extra `approval_required` line first when it has to pair. Other
     /// commands emit JSON only on error. Exit codes: 0 ok, 1 error, 2
     /// approval declined, 3 approval expired
@@ -67,6 +68,9 @@ enum Command {
     },
     /// Approve agents waiting to use this machine
     Approve(ApproveArgs),
+    /// Get a one-time link that lets your browser add a passkey, proven by
+    /// this machine's device key
+    Passkey(PasskeyArgs),
     /// Keep the daemon running in the background (macOS launchd, Linux systemd)
     Service {
         #[command(subcommand)]
@@ -85,6 +89,13 @@ enum ApprovalsAction {
         /// Credential id, as `webmcp approvals` lists it
         id: String,
     },
+}
+
+#[derive(Args)]
+struct PasskeyArgs {
+    /// Do not try to open the link in the default browser
+    #[arg(long)]
+    no_browser: bool,
 }
 
 #[derive(Args)]
@@ -213,9 +224,12 @@ fn main() {
         Err(e) => {
             let message = format!("{e:#}");
             if json {
+                let code = e
+                    .downcast_ref::<PasskeyError>()
+                    .map_or("error", PasskeyError::code);
                 println!(
                     "{}",
-                    output::line(&output::ErrorReport::new("error", &message))
+                    output::line(&output::ErrorReport::new(code, &message))
                 );
             }
             eprintln!("error: {message}");
@@ -249,6 +263,7 @@ fn run(cli: Cli) -> Result<i32> {
         Command::Servers => servers(dir, json)?,
         Command::Approvals { action } => approvals_cmd(&dir, action, json)?,
         Command::Approve(args) => approve_cmd(&dir, args, json)?,
+        Command::Passkey(args) => runtime()?.block_on(passkey_cmd(&dir, args, json))?,
         Command::Service { action } => service_cmd(action, json)?,
     }
     Ok(0)
@@ -371,8 +386,13 @@ fn prompt(question: &str) -> String {
 }
 
 /// Best effort: a headless box or a missing `xdg-open` is not an error, the
-/// link is printed either way.
+/// link is printed either way. Links come from the gateway, and the opener
+/// would launch whatever app claims another scheme, so only web links go.
 fn open_in_browser(link: &str) {
+    if !(link.starts_with("https://") || link.starts_with("http://")) {
+        tracing::warn!(link, "not opening a link that is not a web address");
+        return;
+    }
     let opener = if cfg!(target_os = "macos") {
         "open"
     } else if cfg!(target_os = "linux") {
@@ -1303,5 +1323,28 @@ fn approve_cmd(dir: &Path, args: ApproveArgs, json: bool) -> Result<()> {
         println!("Approved {} ({}, {}).", shown(&a.name), a.kind, a.id);
     }
     println!("A running `webmcp connect` picks this up within a couple of seconds; the next session opens.");
+    Ok(())
+}
+
+async fn passkey_cmd(dir: &Path, args: PasskeyArgs, json: bool) -> Result<()> {
+    let cfg = load_config(dir)?;
+    let key = keys::load(dir)?;
+    let ts = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("the system clock is before 1970")?
+        .as_secs();
+    let link = passkey::request_link(&cfg.base_url, &cfg.device_id, &key, ts).await?;
+    if json {
+        println!("{}", output::line(&output::PasskeyLinkReport::new(&link)));
+    } else {
+        println!(
+            "{}",
+            passkey::instructions(&cfg.handle, &cfg.base_url, &link)
+        );
+        println!("\n    {}\n", link.url);
+    }
+    if !args.no_browser {
+        open_in_browser(&link.url);
+    }
     Ok(())
 }

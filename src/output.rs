@@ -14,6 +14,7 @@ use serde::Serialize;
 use crate::approvals::Agents;
 use crate::config::{ApprovedCredential, Config, ServerEntry};
 use crate::discover::{Definition, Discovered, Source};
+use crate::passkey::PasskeyLink;
 use crate::proto::{CredentialKind, SessionMode, Transport};
 
 /// What the human does once `up` is done.
@@ -274,6 +275,24 @@ pub struct ServiceStatusReport {
     pub running: bool,
     pub pid: Option<u32>,
     pub log: Option<String>,
+}
+
+/// `passkey --json`: the link to open, and for how many seconds it works.
+#[derive(Debug, Serialize)]
+pub struct PasskeyLinkReport<'a> {
+    pub event: &'static str,
+    pub url: &'a str,
+    pub expires_in: u64,
+}
+
+impl<'a> PasskeyLinkReport<'a> {
+    pub fn new(link: &'a PasskeyLink) -> Self {
+        PasskeyLinkReport {
+            event: "passkey_link",
+            url: &link.url,
+            expires_in: link.expires_in,
+        }
+    }
 }
 
 /// `approvals --json`, and the state `approvals on` and `approvals off`

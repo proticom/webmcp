@@ -14,6 +14,7 @@ pub mod keys;
 pub mod lock;
 pub mod output;
 pub mod pair;
+pub mod passkey;
 pub mod platform;
 pub mod proto;
 pub mod relay;

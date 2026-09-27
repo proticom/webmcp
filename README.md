@@ -68,7 +68,7 @@ One command, safe to run again at any point. It does only what is still missing:
     webmcp up --json --attach github --service
 
 `--json` (global; honoured by `up`, `discover`, `status`, `servers`, `attach`, `detach`,
-`approvals`, `approve`, `service status`) prints exactly one JSON object on stdout, on one line;
+`approvals`, `approve`, `passkey`, `service status`) prints exactly one JSON object on stdout, on one line;
 progress and logs go to stderr, and nothing ever prompts. `up` is the one two-line case: if it has to pair it first prints
 
     {"event":"approval_required","verification_uri_complete":"https://webmcp.fast/activate?code=ABCD-EFGH","user_code":"ABCD-EFGH","expires_in":900}
@@ -88,7 +88,9 @@ and `message`; `handle`/`device` are null if it failed before pairing. Any other
 (absent fields omitted); pass an entry's `alias` or `name` to `up --attach`. `webmcp approvals --json`
 (also `approvals on` and `approvals off`) gives
 `{"require_approval":true,"approved":[{"id","kind","name","approved_at"}],"waiting":[{"id","kind","name","servers","last_seen"}]}`;
-`approve --json` gives `{"approved":[…]}` with what it approved, `approvals revoke --json` gives `{"revoked":{…}}`.
+`approve --json` gives `{"approved":[…]}` with what it approved, `approvals revoke --json` gives `{"revoked":{…}}`,
+`passkey --json` gives `{"event":"passkey_link","url":"…","expires_in":600}`, and its failures carry the
+gateway's code (`bad_signature`, `clock_skew`, `unknown_device`, `rate_limited`, `invalid_request`).
 
 ## Manual commands
 
@@ -149,6 +151,16 @@ an agent to this machine. Cost: each new agent needs `webmcp approve` here once,
 only be turned off here. The setting lives in `config.toml`, the gateway has no way to change it, and
 pairing again keeps it. It does not protect against a compromised gateway, which could reuse an
 approved agent's credential id (`THREAT_MODEL.md`).
+
+## Adding a passkey from your machine
+
+    webmcp passkey [--no-browser]
+
+Once your account has a paired device, webmcp.fast accepts a first passkey, or one added without an
+existing passkey to recover the account, only through a link started from that device. So someone who
+knows your email cannot enroll their own passkey first. `webmcp passkey` signs the request with this
+machine's device key, prints the link and tries to open it: open it in the browser where you are
+signed in to `<handle>.webmcp.fast`, within 10 minutes, and add the passkey. The link works once.
 
 ## Running in the background (macOS, Linux)
 
