@@ -381,25 +381,38 @@ fn approval(id: &str, seen: &AgentRecord, at: &str) -> ApprovedCredential {
     }
 }
 
-/// `webmcp approvals on`. With `keep`, every agent that already connected
-/// here is approved; otherwise none is. Returns false, changing nothing,
-/// when approvals were on already.
-pub fn turn_on(dir: &Path, keep: bool, now: SystemTime) -> Result<bool, Error> {
+/// Append an approval for each of `ids` not in `list` yet. Each must be in
+/// `agents`: only a credential that tried this machine can be approved.
+fn add_approvals(
+    list: &mut Vec<ApprovedCredential>,
+    agents: &Agents,
+    ids: &[String],
+    now: SystemTime,
+) -> Result<(), Error> {
+    let at = rfc3339(now);
+    for id in ids {
+        if list.iter().any(|a| a.id == *id) {
+            continue;
+        }
+        let seen = agents
+            .get(id)
+            .ok_or_else(|| Error::UnknownAgent(id.clone()))?;
+        list.push(approval(id, seen, &at));
+    }
+    Ok(())
+}
+
+/// `webmcp approvals on`, approving exactly `keep`: usually what
+/// [`Agents::already_connected`] listed, or nothing. Returns false, changing
+/// nothing, when approvals were on already.
+pub fn turn_on(dir: &Path, keep: &[String], now: SystemTime) -> Result<bool, Error> {
     let mut cfg = Config::load_from(dir)?;
     if cfg.require_approval {
         return Ok(false);
     }
     let agents = Agents::load_from(dir)?;
-    let at = rfc3339(now);
-    cfg.approved = if keep {
-        agents
-            .already_connected()
-            .into_iter()
-            .map(|(id, seen)| approval(id, seen, &at))
-            .collect()
-    } else {
-        Vec::new()
-    };
+    cfg.approved.clear();
+    add_approvals(&mut cfg.approved, &agents, keep, now)?;
     cfg.require_approval = true;
     cfg.save_to(dir)?;
     Ok(true)
@@ -432,20 +445,10 @@ pub fn approve(
         return Err(Error::ApprovalsOff);
     }
     let agents = Agents::load_from(dir)?;
-    let at = rfc3339(now);
-    let mut added: Vec<ApprovedCredential> = Vec::new();
-    for id in ids {
-        let known = |a: &ApprovedCredential| a.id == *id;
-        if cfg.approved.iter().any(known) || added.iter().any(known) {
-            continue;
-        }
-        let seen = agents
-            .get(id)
-            .ok_or_else(|| Error::UnknownAgent(id.clone()))?;
-        added.push(approval(id, seen, &at));
-    }
+    let before = cfg.approved.len();
+    add_approvals(&mut cfg.approved, &agents, ids, now)?;
+    let added = cfg.approved[before..].to_vec();
     if !added.is_empty() {
-        cfg.approved.extend(added.iter().cloned());
         cfg.save_to(dir)?;
     }
     Ok(added)
@@ -711,32 +714,53 @@ mod tests {
         assert!(waiting(&dir).is_empty());
     }
 
+    fn already_connected(dir: &tempfile::TempDir) -> Vec<String> {
+        let agents = Agents::load_from(dir.path()).unwrap();
+        let ids = agents.already_connected();
+        ids.into_iter().map(|(id, _)| id.to_string()).collect()
+    }
+
     #[test]
     fn turning_on_keeps_the_agents_that_already_connected() {
         let dir = machine(false, &[("a", false), ("b", true), ("c", false)]);
-        assert!(turn_on(dir.path(), true, at(T0 + 100)).unwrap());
+        // Every agent seen and not waiting, most recently seen first.
+        let keep = already_connected(&dir);
+        assert_eq!(keep, ["c", "a"]);
+        assert!(turn_on(dir.path(), &keep, at(T0 + 100)).unwrap());
         let cfg = config(&dir);
         assert!(cfg.require_approval);
         let at_100 = "2026-09-21T14:15:00Z";
         assert_eq!(cfg.approved, [approved("c", at_100), approved("a", at_100)]);
 
         // Already on: nothing changes, whatever `keep` says.
-        assert!(!turn_on(dir.path(), false, at(T0 + 200)).unwrap());
+        assert!(!turn_on(dir.path(), &[], at(T0 + 200)).unwrap());
         assert_eq!(config(&dir), cfg);
     }
 
     #[test]
     fn turning_on_without_keep_approves_nobody() {
         let dir = machine(false, &[("a", false), ("b", true)]);
-        assert!(turn_on(dir.path(), false, at(T0)).unwrap());
+        assert!(turn_on(dir.path(), &[], at(T0)).unwrap());
         let cfg = config(&dir);
         assert!(cfg.require_approval && cfg.approved.is_empty());
     }
 
     #[test]
+    fn turning_on_with_an_unknown_id_changes_nothing() {
+        let dir = machine(false, &[("a", false)]);
+        let keep = ["a".to_string(), "nope".to_string()];
+        assert!(matches!(
+            turn_on(dir.path(), &keep, at(T0)),
+            Err(Error::UnknownAgent(id)) if id == "nope"
+        ));
+        let cfg = config(&dir);
+        assert!(!cfg.require_approval && cfg.approved.is_empty());
+    }
+
+    #[test]
     fn turning_off_forgets_approvals() {
         let dir = machine(false, &[("a", false)]);
-        turn_on(dir.path(), true, at(T0)).unwrap();
+        turn_on(dir.path(), &already_connected(&dir), at(T0)).unwrap();
         assert_eq!(config(&dir).approved.len(), 1);
         assert!(turn_off(dir.path()).unwrap());
         let cfg = config(&dir);

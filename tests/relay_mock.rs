@@ -1321,7 +1321,7 @@ async fn turning_approvals_on_and_off_re_advertises_and_ends_unapproved_sessions
 
     // On, keeping nobody: neither session is approved, and the one without
     // a credential never can be.
-    assert!(approvals::turn_on(live.dir(), false, SystemTime::now()).unwrap());
+    assert!(approvals::turn_on(live.dir(), &[], SystemTime::now()).unwrap());
     let closes = gw.recv_closes(2).await;
     assert_eq!(
         closes,
@@ -1352,7 +1352,15 @@ async fn turning_approvals_on_keeping_existing_agents_leaves_their_sessions_alon
     assert_eq!(gw.init_as("ses_a", "fs", &a).await, "fake");
     let pid = fake.pids(1).await[0];
 
-    assert!(approvals::turn_on(live.dir(), true, SystemTime::now()).unwrap());
+    // What `webmcp approvals on` keeps by default: every agent seen here.
+    let agents = live.agents();
+    let keep: Vec<String> = agents
+        .already_connected()
+        .into_iter()
+        .map(|(id, _)| id.to_string())
+        .collect();
+    assert_eq!(keep, ["grt_a"]);
+    assert!(approvals::turn_on(live.dir(), &keep, SystemTime::now()).unwrap());
     // No close before the new offer: the kept agent's session lives on.
     assert_eq!(gw.recv_advert().await, (vec!["fs".to_string()], true));
     gw.roundtrip("ses_a", 2).await;
