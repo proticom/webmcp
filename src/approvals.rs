@@ -689,8 +689,10 @@ mod tests {
         let command = notify_command(text.clone());
         assert_eq!(command.as_ref().map(|(program, _)| *program), platform);
         if let Some((_, args)) = command {
-            assert_eq!(args[args.len() - 2], "--");
-            assert_eq!(args[args.len() - 1], text);
+            // Options end before any data: nothing after `--` is read as a flag or as script.
+            let end_of_options = args.iter().position(|a| a == "--").expect("-- present");
+            assert_eq!(args.last(), Some(&text));
+            assert!(end_of_options < args.len() - 1);
             assert_eq!(args.iter().filter(|a| **a == text).count(), 1);
         }
     }
