@@ -853,7 +853,9 @@ impl LiveConfig {
                 base_url: "https://webmcp.fast".into(),
                 relay_url: o.relay_url.clone(),
                 hardware_id: "ab".repeat(32),
+                require_approval: false,
                 servers: entries,
+                approved: vec![],
             };
             c.save_to(dir.path()).unwrap();
             o.config_path = Some(Config::path_in(dir.path()));

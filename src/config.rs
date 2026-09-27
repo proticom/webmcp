@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::approvals::Admission;
 use crate::error::Error;
-use crate::proto::{ServerInfo, ServerStatus, SessionMode, Transport};
+use crate::proto::{CredentialKind, ServerInfo, ServerStatus, SessionMode, Transport};
 
 /// Name of the config file inside the config directory.
 pub const CONFIG_FILE: &str = "config.toml";
@@ -57,8 +58,30 @@ pub struct Config {
     pub base_url: String,
     pub relay_url: String,
     pub hardware_id: String,
+    /// A new agent credential opens no session on this machine until it is
+    /// approved here (`webmcp approvals on`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub require_approval: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub servers: Vec<ServerEntry>,
+    /// Credentials approved on this machine. Enforced only with
+    /// `require_approval`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approved: Vec<ApprovedCredential>,
+}
+
+/// An agent credential approved on this machine (`webmcp approve`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovedCredential {
+    pub id: String,
+    pub kind: CredentialKind,
+    pub name: String,
+    /// RFC 3339 UTC.
+    pub approved_at: String,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// One attached MCP server.
@@ -182,6 +205,37 @@ impl ServerEntry {
     }
 }
 
+/// Write `dir/name` atomically through a temporary sibling, readable by the
+/// owner only.
+pub(crate) fn write_private(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), Error> {
+    std::fs::create_dir_all(dir).map_err(|e| Error::io("create config dir", dir, e))?;
+    let path = dir.join(name);
+    let tmp = dir.join(format!("{name}.tmp"));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    {
+        use std::io::Write;
+        let mut f = opts
+            .open(&tmp)
+            .map_err(|e| Error::io("create file", &tmp, e))?;
+        f.write_all(bytes)
+            .map_err(|e| Error::io("write file", &tmp, e))?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| Error::io("chmod file", &tmp, e))?;
+    }
+    std::fs::rename(&tmp, &path).map_err(|e| Error::io("rename file", &path, e))?;
+    Ok(())
+}
+
 pub fn validate_alias(alias: &str) -> Result<(), Error> {
     if is_valid_alias(alias) {
         Ok(())
@@ -251,33 +305,18 @@ impl Config {
     /// Write to `dir/config.toml` atomically, readable by the owner only:
     /// `env` values copied from other tools' configs can be API keys.
     pub fn save_to(&self, dir: &Path) -> Result<(), Error> {
-        std::fs::create_dir_all(dir).map_err(|e| Error::io("create config dir", dir, e))?;
-        let path = Self::path_in(dir);
-        let tmp = dir.join(format!("{CONFIG_FILE}.tmp"));
         let text = toml::to_string_pretty(self).map_err(|e| Error::Corrupt(e.to_string()))?;
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+        write_private(dir, CONFIG_FILE, text.as_bytes())
+    }
+
+    /// What the relay enforces: every credential while approvals are off,
+    /// only the approved ones while they are on.
+    pub fn admission(&self) -> Admission {
+        if self.require_approval {
+            Admission::Approved(self.approved.iter().map(|a| a.id.clone()).collect())
+        } else {
+            Admission::Open
         }
-        {
-            use std::io::Write;
-            let mut f = opts
-                .open(&tmp)
-                .map_err(|e| Error::io("create config", &tmp, e))?;
-            f.write_all(text.as_bytes())
-                .map_err(|e| Error::io("write config", &tmp, e))?;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| Error::io("chmod config", &tmp, e))?;
-        }
-        std::fs::rename(&tmp, &path).map_err(|e| Error::io("rename config", &path, e))?;
-        Ok(())
     }
 
     /// Add a server; the alias must be unused.
@@ -318,8 +357,57 @@ mod tests {
             base_url: "https://webmcp.fast".into(),
             relay_url: "wss://webmcp.fast/connect".into(),
             hardware_id: "ab".repeat(32),
+            require_approval: false,
             servers: vec![],
+            approved: vec![],
         }
+    }
+
+    #[test]
+    fn approvals_roundtrip_and_stay_out_of_the_file_while_unused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = sample();
+        cfg.save_to(dir.path()).unwrap();
+        let text = std::fs::read_to_string(Config::path_in(dir.path())).unwrap();
+        assert!(!text.contains("require_approval"), "{text}");
+        assert!(!text.contains("approved"), "{text}");
+        assert_eq!(
+            Config::load_from(dir.path()).unwrap().admission(),
+            Admission::Open
+        );
+
+        cfg.require_approval = true;
+        cfg.attach(ServerEntry::stdio("fs", "srv", SessionMode::PerSession).unwrap())
+            .unwrap();
+        cfg.approved.push(ApprovedCredential {
+            id: "grt_0123456789abcdef".into(),
+            kind: CredentialKind::Oauth,
+            name: "Claude \"desktop\"".into(),
+            approved_at: "2026-09-27T08:05:09Z".into(),
+        });
+        cfg.save_to(dir.path()).unwrap();
+        let text = std::fs::read_to_string(Config::path_in(dir.path())).unwrap();
+        assert!(text.contains("require_approval = true\n"), "{text}");
+        assert!(text.contains("[[approved]]\n"), "{text}");
+        let back = Config::load_from(dir.path()).unwrap();
+        assert_eq!(back, cfg);
+        assert_eq!(
+            back.admission(),
+            Admission::Approved(["grt_0123456789abcdef".to_string()].into())
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(Config::path_in(dir.path()))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
+        // Approved ids are not enforced while approvals are off.
+        cfg.require_approval = false;
+        assert_eq!(cfg.admission(), Admission::Open);
     }
 
     #[test]
@@ -438,6 +526,7 @@ mod tests {
         assert_eq!(fs.mode, SessionMode::PerSession);
         assert!(fs.env.is_empty() && fs.cwd.is_none() && fs.max_sessions.is_none());
         assert_eq!(fs.argv().unwrap(), ["npx", "-y", "fs", "/tmp"]);
+        assert!(!cfg.require_approval && cfg.approved.is_empty());
     }
 
     #[test]

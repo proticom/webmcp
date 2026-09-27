@@ -192,7 +192,9 @@ mod tests {
             base_url: "https://webmcp.fast".into(),
             relay_url: "wss://webmcp.fast/connect".into(),
             hardware_id: "ab".repeat(32),
+            require_approval: false,
             servers,
+            approved: vec![],
         }
     }
 

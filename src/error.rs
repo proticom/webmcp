@@ -24,6 +24,12 @@ pub enum Error {
     NoSuchAlias(String),
     #[error("no config directory could be determined for this platform")]
     NoConfigDir,
+    #[error("approvals are off, so every agent the owner connects can already use this machine; `webmcp approvals on` turns them on")]
+    ApprovalsOff,
+    #[error("`{0}` has not tried to use this machine; `webmcp approvals` lists the agents waiting for approval")]
+    UnknownAgent(String),
+    #[error("`{0}` is not approved on this machine; `webmcp approvals` lists the approved agents")]
+    NotApproved(String),
 }
 
 impl Error {

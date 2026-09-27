@@ -289,10 +289,12 @@ mod tests {
             base_url: "https://webmcp.fast".into(),
             relay_url: "wss://webmcp.fast/connect".into(),
             hardware_id: "ab".repeat(32),
+            require_approval: false,
             servers: vec![
                 ServerEntry::stdio("github", "npx -y gh", SessionMode::PerSession).unwrap(),
                 ServerEntry::http("web", "http://localhost:3000/mcp", SessionMode::Shared).unwrap(),
             ],
+            approved: vec![],
         }
     }
 

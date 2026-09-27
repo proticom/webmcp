@@ -5,7 +5,7 @@ use std::path::Path;
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{self, Config, ServerEntry};
+use crate::config::{self, Config};
 use crate::error::Error;
 use crate::{keys, platform};
 
@@ -40,16 +40,21 @@ pub struct PairResponse {
 
 /// Persist a fresh pairing: the key first (a config without a key is
 /// useless, the reverse is harmless), then the config. Shared by `login` and
-/// `up`. `servers` carries the attached set over a re-pair.
+/// `up`. `previous` is the config a re-pair replaces: its attached servers
+/// and its approval settings carry over, so pairing again never turns local
+/// approval off.
 pub fn persist(
     dir: &Path,
     key: &SigningKey,
     resp: PairResponse,
     requested_name: String,
     hardware_id: String,
-    servers: Vec<ServerEntry>,
+    previous: Option<Config>,
 ) -> Result<Config, Error> {
     keys::save(dir, key)?;
+    let (servers, require_approval, approved) = previous
+        .map(|p| (p.servers, p.require_approval, p.approved))
+        .unwrap_or_default();
     let cfg = Config {
         device_id: resp.device_id,
         handle: resp.handle,
@@ -61,7 +66,9 @@ pub fn persist(
         base_url: resp.base_url,
         relay_url: resp.relay_url,
         hardware_id,
+        require_approval,
         servers,
+        approved,
     };
     cfg.save_to(dir)?;
     Ok(cfg)
@@ -201,6 +208,56 @@ mod tests {
         assert_eq!(
             pair_url("http://localhost:8787"),
             "http://localhost:8787/api/v1/pair"
+        );
+    }
+
+    #[test]
+    fn a_re_pair_keeps_servers_and_approvals() {
+        use crate::config::{ApprovedCredential, ServerEntry};
+        use crate::proto::{CredentialKind, SessionMode};
+        let dir = tempfile::tempdir().unwrap();
+        let resp = |device_id: &str| PairResponse {
+            device_id: device_id.into(),
+            handle: "alice".into(),
+            org_id: None,
+            relay_url: "wss://webmcp.fast/connect".into(),
+            base_url: "https://webmcp.fast".into(),
+            device_name: None,
+        };
+        let key = keys::generate();
+        let mut first = persist(
+            dir.path(),
+            &key,
+            resp("dev_1"),
+            "mac".into(),
+            "00".into(),
+            None,
+        )
+        .unwrap();
+        assert!(!first.require_approval && first.servers.is_empty() && first.approved.is_empty());
+
+        first.require_approval = true;
+        first.servers = vec![ServerEntry::stdio("fs", "srv", SessionMode::PerSession).unwrap()];
+        first.approved = vec![ApprovedCredential {
+            id: "ctk_1".into(),
+            kind: CredentialKind::Token,
+            name: "ci".into(),
+            approved_at: "2026-09-21T14:13:20Z".into(),
+        }];
+        let again = persist(
+            dir.path(),
+            &key,
+            resp("dev_2"),
+            "mac".into(),
+            "00".into(),
+            Some(first.clone()),
+        )
+        .unwrap();
+        assert_eq!(again.device_id, "dev_2");
+        assert!(again.require_approval);
+        assert_eq!(
+            (again.servers, again.approved),
+            (first.servers, first.approved)
         );
     }
 }
