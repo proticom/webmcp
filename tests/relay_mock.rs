@@ -2,9 +2,10 @@
 //! one side, a fake stdio MCP server (a `sh` script) or an in-process HTTP
 //! MCP endpoint on the other. No network, no npx.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -16,11 +17,13 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
-use webmcp_daemon::config::{Config, ServerEntry};
+use webmcp_daemon::approvals::{self, Agents};
+use webmcp_daemon::config::{ApprovedCredential, Config, ServerEntry};
 use webmcp_daemon::connect::{self, ConnectOptions};
 use webmcp_daemon::keys;
 use webmcp_daemon::proto::{
-    connect_sign_message, ClientInfo, Frame, ServerStatus, SessionMode, PING, PONG,
+    connect_sign_message, ClientInfo, Credential, CredentialKind, Frame, ServerStatus, SessionMode,
+    PING, PONG,
 };
 
 const DEVICE_ID: &str = "dev_0123456789abcdef";
@@ -47,7 +50,17 @@ impl Gateway {
         self.cmd.send(Cmd::Send(frame)).unwrap();
     }
 
+    /// `session_open` with no credential, as older gateways send it.
     fn open(&self, sid: &str, server: &str) {
+        self.open_with(sid, server, None);
+    }
+
+    /// `session_open` for an agent holding `credential`.
+    fn open_as(&self, sid: &str, server: &str, credential: &Credential) {
+        self.open_with(sid, server, Some(credential.clone()));
+    }
+
+    fn open_with(&self, sid: &str, server: &str, credential: Option<Credential>) {
         self.send(Frame::SessionOpen {
             sid: sid.into(),
             server: server.into(),
@@ -56,7 +69,7 @@ impl Gateway {
                 version: Some("1.0".into()),
                 extra: Default::default(),
             }),
-            credential: None,
+            credential,
         });
     }
 
@@ -205,12 +218,19 @@ async fn start(
     opts.backoff_max = Duration::from_millis(50);
     opts.serve(&entries);
     tweak(&mut opts);
+    let require_approval = opts.admission.required();
     let daemon = Daemon(tokio::spawn(async move {
         let _ = connect::run(&opts).await;
     }));
     // Every connection starts with the `servers` frame.
     match gw.recv().await {
-        Frame::Servers { servers, .. } => assert_eq!(servers.len(), entries.len()),
+        Frame::Servers {
+            servers,
+            require_approval: flag,
+        } => {
+            assert_eq!(servers.len(), entries.len());
+            assert_eq!(flag, require_approval);
+        }
         other => panic!("expected servers, got {other:?}"),
     }
     (gw, daemon)
@@ -842,10 +862,18 @@ struct LiveConfig {
 
 impl LiveConfig {
     async fn start(entries: Vec<ServerEntry>) -> (Gateway, Daemon, LiveConfig) {
+        Self::start_with(entries, |_| {}).await
+    }
+
+    /// Like [`Self::start`], with `edit` applied to the config first.
+    async fn start_with(
+        entries: Vec<ServerEntry>,
+        edit: impl FnOnce(&mut Config),
+    ) -> (Gateway, Daemon, LiveConfig) {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = None;
         let (gw, daemon) = start(entries.clone(), |o| {
-            let c = Config {
+            let mut c = Config {
                 device_id: o.device_id.clone(),
                 handle: "alice".into(),
                 device_name: "macbook".into(),
@@ -857,7 +885,9 @@ impl LiveConfig {
                 servers: entries,
                 approved: vec![],
             };
+            edit(&mut c);
             c.save_to(dir.path()).unwrap();
+            o.admission = c.admission();
             o.config_path = Some(Config::path_in(dir.path()));
             o.config_poll_interval = Duration::from_millis(50);
             cfg = Some(c);
@@ -867,20 +897,69 @@ impl LiveConfig {
         (gw, daemon, LiveConfig { dir, cfg })
     }
 
-    /// What `webmcp attach` / `detach` do: rewrite the file atomically.
+    fn dir(&self) -> &Path {
+        self.dir.path()
+    }
+
+    /// What `webmcp attach` / `detach` do: rewrite the file atomically,
+    /// from the config as this helper last wrote it.
     fn rewrite(&mut self, servers: Vec<ServerEntry>) {
         self.cfg.servers = servers;
         self.cfg.save_to(self.dir.path()).unwrap();
+    }
+
+    /// `agents.json` as the daemon left it.
+    fn agents(&self) -> Agents {
+        Agents::load_from(self.dir()).unwrap()
     }
 }
 
 impl Gateway {
     /// Next frame must be `servers`; returns the advertised aliases.
     async fn recv_servers(&mut self) -> Vec<String> {
+        self.recv_advert().await.0
+    }
+
+    /// Next frame must be `servers`; returns the aliases and whether it
+    /// says the device requires approval.
+    async fn recv_advert(&mut self) -> (Vec<String>, bool) {
         match self.recv().await {
-            Frame::Servers { servers, .. } => servers.into_iter().map(|s| s.alias).collect(),
+            Frame::Servers {
+                servers,
+                require_approval,
+            } => (
+                servers.into_iter().map(|s| s.alias).collect(),
+                require_approval,
+            ),
             other => panic!("expected servers, got {other:?}"),
         }
+    }
+
+    /// The next `n` frames must be `session_close`; returns sid → reason.
+    /// For closes sent together, whose order is not defined.
+    async fn recv_closes(&mut self, n: usize) -> BTreeMap<String, String> {
+        let mut closes = BTreeMap::new();
+        for _ in 0..n {
+            match self.recv().await {
+                Frame::SessionClose { sid, reason } => {
+                    closes.insert(sid, reason.unwrap_or_default());
+                }
+                other => panic!("expected session_close, got {other:?}"),
+            }
+        }
+        closes
+    }
+
+    /// Like [`Self::init`], as an agent holding `credential`.
+    async fn init_as(&mut self, sid: &str, server: &str, credential: &Credential) -> String {
+        self.open_as(sid, server, credential);
+        self.mcp(sid, initialize(1));
+        let init = self.recv_mcp(sid).await;
+        assert_eq!(init["id"], 1);
+        init["result"]["serverInfo"]["name"]
+            .as_str()
+            .unwrap()
+            .to_string()
     }
 
     /// Open `sid` on `server` and return the `serverInfo.name` it answers
@@ -1056,4 +1135,233 @@ async fn gateway_detach_removes_the_alias_from_the_config_and_nothing_else() {
     gw.open("ses_b", "b");
     gw.mcp("ses_b", initialize(1));
     assert_eq!(gw.recv_mcp("ses_b").await["id"], 1);
+}
+
+// ------------------------------------------------- local approval of agents
+
+fn agent(id: &str, name: &str) -> Credential {
+    Credential {
+        id: id.into(),
+        kind: CredentialKind::Oauth,
+        name: name.into(),
+    }
+}
+
+fn approval(id: &str) -> ApprovedCredential {
+    ApprovedCredential {
+        id: id.into(),
+        kind: CredentialKind::Oauth,
+        name: format!("agent {id}"),
+        approved_at: "2026-09-21T14:13:20Z".into(),
+    }
+}
+
+/// Approvals on, with these credentials approved.
+fn approvals_on(approved: &[&str]) -> impl FnOnce(&mut Config) {
+    let approved: Vec<ApprovedCredential> = approved.iter().map(|id| approval(id)).collect();
+    move |c: &mut Config| {
+        c.require_approval = true;
+        c.approved = approved;
+    }
+}
+
+#[tokio::test]
+async fn approvals_on_refuse_a_new_agent_record_it_waiting_and_start_nothing() {
+    let fake = FakeServer::new();
+    let fs = fake.entry("fs", SessionMode::PerSession);
+    // `start` checked that the first `servers` frame says approval is required.
+    let (mut gw, _daemon, live) = LiveConfig::start_with(vec![fs], approvals_on(&[])).await;
+
+    gw.open_as("ses_1", "fs", &agent("grt_new", "Claude"));
+    assert_eq!(gw.recv_close("ses_1").await, "approval_required");
+    assert!(
+        !fake.path("pids").exists(),
+        "no backend for a refused agent"
+    );
+
+    let agents = live.agents();
+    let seen = agents
+        .get("grt_new")
+        .expect("the refused agent is recorded");
+    assert_eq!(seen.kind, CredentialKind::Oauth);
+    assert_eq!(seen.name, "Claude");
+    assert_eq!(seen.clients, ["test-harness"]);
+    assert_eq!(seen.servers, ["fs"]);
+    assert_eq!(seen.first_seen, seen.last_seen);
+    assert!(seen.waiting);
+    let cfg = Config::load_from(live.dir()).unwrap();
+    let waiting: Vec<&str> = agents.waiting(&cfg).into_iter().map(|(id, _)| id).collect();
+    assert_eq!(waiting, ["grt_new"]);
+}
+
+#[tokio::test]
+async fn an_approved_agent_opens_and_relays_and_a_refused_one_evicts_nothing() {
+    let fake = FakeServer::new();
+    let mut fs = fake.entry("fs", SessionMode::PerSession);
+    fs.max_sessions = Some(1);
+    let (mut gw, _daemon, live) = LiveConfig::start_with(vec![fs], approvals_on(&["grt_ok"])).await;
+
+    assert_eq!(
+        gw.init_as("ses_1", "fs", &agent("grt_ok", "Claude")).await,
+        "fake"
+    );
+    gw.roundtrip("ses_1", 2).await;
+    let pid = fake.pids(1).await[0];
+
+    // The server is at its cap with an idle session: an agent that is not
+    // approved is refused before it could evict it.
+    gw.open_as("ses_2", "fs", &agent("grt_other", "Other"));
+    assert_eq!(gw.recv_close("ses_2").await, "approval_required");
+    gw.roundtrip("ses_1", 3).await;
+    assert!(alive(pid));
+
+    let agents = live.agents();
+    assert!(!agents.get("grt_ok").unwrap().waiting);
+    assert!(agents.get("grt_other").unwrap().waiting);
+}
+
+#[tokio::test]
+async fn approvals_on_refuse_a_session_without_a_credential() {
+    let fake = FakeServer::new();
+    let fs = fake.entry("fs", SessionMode::PerSession);
+    let (mut gw, _daemon, live) = LiveConfig::start_with(vec![fs], approvals_on(&[])).await;
+    // An older gateway sends no credential: fail closed.
+    gw.open("ses_1", "fs");
+    assert_eq!(gw.recv_close("ses_1").await, "approval_required");
+    assert!(!fake.path("pids").exists());
+    assert!(!Agents::path_in(live.dir()).exists(), "nothing to record");
+}
+
+#[tokio::test]
+async fn approvals_off_admit_any_agent_and_still_record_it() {
+    let fake = FakeServer::new();
+    let (mut gw, _daemon, live) =
+        LiveConfig::start(vec![fake.entry("fs", SessionMode::PerSession)]).await;
+    let ci = Credential {
+        kind: CredentialKind::Token,
+        ..agent("ctk_ci", "ci runner")
+    };
+    assert_eq!(gw.init_as("ses_1", "fs", &ci).await, "fake");
+    // No credential at all: today's behaviour.
+    assert_eq!(gw.init("ses_2", "fs").await, "fake");
+
+    let agents = live.agents();
+    let seen = agents
+        .get("ctk_ci")
+        .expect("recorded while approvals are off");
+    assert_eq!(seen.kind, CredentialKind::Token);
+    assert_eq!(seen.name, "ci runner");
+    assert_eq!(seen.servers, ["fs"]);
+    assert!(!seen.waiting);
+    // So `webmcp approvals on` can offer to keep it.
+    let kept: Vec<&str> = agents
+        .already_connected()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(kept, ["ctk_ci"]);
+}
+
+#[tokio::test]
+async fn approving_a_waiting_agent_lets_its_next_session_open() {
+    let fake = FakeServer::new();
+    let fs = fake.entry("fs", SessionMode::PerSession);
+    let (mut gw, _daemon, live) = LiveConfig::start_with(vec![fs], approvals_on(&[])).await;
+    let claude = agent("grt_new", "Claude");
+    gw.open_as("ses_1", "fs", &claude);
+    assert_eq!(gw.recv_close("ses_1").await, "approval_required");
+
+    let added =
+        approvals::approve(live.dir(), &["grt_new".to_string()], SystemTime::now()).unwrap();
+    assert_eq!(added.len(), 1);
+    assert_eq!(
+        (added[0].id.as_str(), added[0].name.as_str()),
+        ("grt_new", "Claude")
+    );
+    // The reload ends nothing and advertises again.
+    assert_eq!(gw.recv_advert().await, (vec!["fs".to_string()], true));
+    assert_eq!(gw.init_as("ses_2", "fs", &claude).await, "fake");
+    assert!(!live.agents().get("grt_new").unwrap().waiting);
+}
+
+#[tokio::test]
+async fn revoking_an_approval_ends_that_agents_live_sessions() {
+    let fake = FakeServer::new();
+    let fs = fake.entry("fs", SessionMode::PerSession);
+    let (mut gw, _daemon, live) =
+        LiveConfig::start_with(vec![fs], approvals_on(&["grt_a", "grt_b"])).await;
+    let (a, b) = (agent("grt_a", "A"), agent("grt_b", "B"));
+    assert_eq!(gw.init_as("ses_a", "fs", &a).await, "fake");
+    let pid_a = fake.pids(1).await[0];
+    assert_eq!(gw.init_as("ses_b", "fs", &b).await, "fake");
+    let pid_b = fake.pids(2).await[1];
+
+    let revoked = approvals::revoke(live.dir(), "grt_a").unwrap();
+    assert_eq!(revoked, approval("grt_a"));
+    // The close comes first, then the unchanged offer.
+    assert_eq!(gw.recv_close("ses_a").await, "approval_required");
+    assert_eq!(gw.recv_advert().await, (vec!["fs".to_string()], true));
+    assert_dies(pid_a).await;
+
+    gw.roundtrip("ses_b", 2).await;
+    assert!(alive(pid_b));
+    gw.open_as("ses_a2", "fs", &a);
+    assert_eq!(gw.recv_close("ses_a2").await, "approval_required");
+}
+
+#[tokio::test]
+async fn turning_approvals_on_and_off_re_advertises_and_ends_unapproved_sessions() {
+    let fake = FakeServer::new();
+    let (mut gw, _daemon, live) =
+        LiveConfig::start(vec![fake.entry("fs", SessionMode::PerSession)]).await;
+    let a = agent("grt_a", "A");
+    assert_eq!(gw.init_as("ses_a", "fs", &a).await, "fake");
+    assert_eq!(gw.init("ses_legacy", "fs").await, "fake");
+    let pids = fake.pids(2).await;
+
+    // On, keeping nobody: neither session is approved, and the one without
+    // a credential never can be.
+    assert!(approvals::turn_on(live.dir(), false, SystemTime::now()).unwrap());
+    let closes = gw.recv_closes(2).await;
+    assert_eq!(
+        closes,
+        BTreeMap::from([
+            ("ses_a".to_string(), "approval_required".to_string()),
+            ("ses_legacy".to_string(), "approval_required".to_string()),
+        ])
+    );
+    assert_eq!(gw.recv_advert().await, (vec!["fs".to_string()], true));
+    for pid in pids {
+        assert_dies(pid).await;
+    }
+    gw.open_as("ses_a2", "fs", &a);
+    assert_eq!(gw.recv_close("ses_a2").await, "approval_required");
+
+    // Off: nothing ends, the flag goes, and the agent is back.
+    assert!(approvals::turn_off(live.dir()).unwrap());
+    assert_eq!(gw.recv_advert().await, (vec!["fs".to_string()], false));
+    assert_eq!(gw.init_as("ses_a3", "fs", &a).await, "fake");
+}
+
+#[tokio::test]
+async fn turning_approvals_on_keeping_existing_agents_leaves_their_sessions_alone() {
+    let fake = FakeServer::new();
+    let (mut gw, _daemon, live) =
+        LiveConfig::start(vec![fake.entry("fs", SessionMode::PerSession)]).await;
+    let a = agent("grt_a", "A");
+    assert_eq!(gw.init_as("ses_a", "fs", &a).await, "fake");
+    let pid = fake.pids(1).await[0];
+
+    assert!(approvals::turn_on(live.dir(), true, SystemTime::now()).unwrap());
+    // No close before the new offer: the kept agent's session lives on.
+    assert_eq!(gw.recv_advert().await, (vec!["fs".to_string()], true));
+    gw.roundtrip("ses_a", 2).await;
+    assert!(alive(pid));
+    // A new agent now has to wait.
+    gw.open_as("ses_new", "fs", &agent("grt_new", "New"));
+    assert_eq!(gw.recv_close("ses_new").await, "approval_required");
+    assert_eq!(
+        Config::load_from(live.dir()).unwrap().approved[0].id,
+        "grt_a"
+    );
 }

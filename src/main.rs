@@ -16,7 +16,7 @@ use webmcp_daemon::lock::{InstanceLock, LockError};
 use webmcp_daemon::output::{self, ServiceOutcome, UpEvent, UpReport};
 use webmcp_daemon::pair::{self, PairError, PairRequest};
 use webmcp_daemon::proto::SessionMode;
-use webmcp_daemon::{keys, platform, service, Error};
+use webmcp_daemon::{approvals, keys, platform, service, Error};
 
 const DEFAULT_BASE_URL: &str = "https://webmcp.fast";
 
@@ -698,8 +698,10 @@ async fn connect_cmd(dir: PathBuf, args: ConnectArgs) -> Result<()> {
     let _lock = InstanceLock::acquire(&dir)?;
     let mut opts = ConnectOptions::new(cfg.relay_url.clone(), cfg.device_id.clone(), key);
     opts.serve(&cfg.servers);
+    opts.admission = cfg.admission();
+    opts.notify = std::env::var_os(approvals::NO_NOTIFY_ENV).is_none();
     opts.once = args.once;
-    // `attach` and `detach` edit this file while we run; follow it.
+    // `attach`, `detach` and `approve` edit this file while we run; follow it.
     opts.config_path = Some(Config::path_in(&dir));
     for s in opts.servers.iter().filter(|s| s.error.is_some()) {
         tracing::warn!(server = %s.alias, "{}", s.error.as_deref().unwrap_or(""));
@@ -709,6 +711,7 @@ async fn connect_cmd(dir: PathBuf, args: ConnectArgs) -> Result<()> {
         device = %cfg.device_name,
         relay = %cfg.relay_url,
         servers = opts.servers.len(),
+        require_approval = cfg.require_approval,
         "connecting"
     );
 
