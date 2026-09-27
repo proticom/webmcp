@@ -279,7 +279,9 @@ fn attaching_carries_env_values_into_the_config() {
         base_url: "https://webmcp.fast".into(),
         relay_url: "wss://webmcp.fast/connect".into(),
         hardware_id: "00".into(),
+        require_approval: false,
         servers: vec![],
+        approved: vec![],
     };
     cfg.attach(entry).unwrap();
     cfg.save_to(dir.path()).unwrap();

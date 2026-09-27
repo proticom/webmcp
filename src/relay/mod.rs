@@ -20,9 +20,10 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
+use crate::approvals::{Admission, Recorder};
 use crate::config::ServerEntry;
 use crate::platform;
-use crate::proto::{ClientInfo, Frame, SessionMode, Transport};
+use crate::proto::{ClientInfo, Credential, Frame, SessionMode, Transport};
 
 /// Largest `mcp` frame accepted from the gateway (wire bytes).
 pub const MAX_GATEWAY_FRAME_BYTES: usize = 1 << 20;
@@ -55,6 +56,9 @@ pub mod reason {
     pub const DETACHED: &str = "detached";
     /// Hot reload: the alias is still attached but its definition changed.
     pub const RECONFIGURED: &str = "reconfigured";
+    /// Approvals are on and the session's credential is not approved on
+    /// this machine, or it has none.
+    pub const APPROVAL_REQUIRED: &str = "approval_required";
     /// Prefix; followed by `: <short message>`.
     pub const SPAWN_FAILED: &str = "spawn_failed";
 }
@@ -150,6 +154,8 @@ struct SessionHandle {
     /// Distinguishes two sessions that reuse one `sid`.
     id: u64,
     alias: String,
+    /// Id of the agent credential that opened it, if the gateway said.
+    credential: Option<String>,
     /// Gateway → backend messages.
     tx: mpsc::Sender<Value>,
     /// Dropping it is the close signal, seen even while `tx` is backed up.
@@ -163,6 +169,7 @@ type Sessions = Arc<Mutex<HashMap<String, SessionHandle>>>;
 /// Session table for one connection.
 pub struct Relay {
     backends: HashMap<String, ServerEntry>,
+    admission: Admission,
     opts: RelayOptions,
     out: mpsc::Sender<Message>,
     http: reqwest::Client,
@@ -172,7 +179,12 @@ pub struct Relay {
 
 impl Relay {
     /// `out` feeds the connection's writer task.
-    pub fn new(backends: &[ServerEntry], opts: RelayOptions, out: mpsc::Sender<Message>) -> Self {
+    pub fn new(
+        backends: &[ServerEntry],
+        admission: Admission,
+        opts: RelayOptions,
+        out: mpsc::Sender<Message>,
+    ) -> Self {
         let http = reqwest::Client::builder()
             .user_agent(platform::user_agent())
             .connect_timeout(Duration::from_secs(10))
@@ -185,6 +197,7 @@ impl Relay {
                 .iter()
                 .map(|e| (e.alias.clone(), e.clone()))
                 .collect(),
+            admission,
             opts,
             out,
             http,
@@ -200,8 +213,16 @@ impl Relay {
 
     /// `session_open`: start a backend for `sid`, or refuse with a
     /// `session_close`. There is no ack; `mcp` frames that follow are queued
-    /// until the backend is ready.
-    pub async fn open(&mut self, sid: String, server: String, client: Option<ClientInfo>) {
+    /// until the backend is ready. Every credential that gets as far as the
+    /// approval check is recorded, admitted or not.
+    pub async fn open(
+        &mut self,
+        sid: String,
+        server: String,
+        client: Option<ClientInfo>,
+        credential: Option<Credential>,
+        recorder: &mut Recorder,
+    ) {
         if let Some(old) = self.take(&sid) {
             warn!(%sid, "session_open for a live sid; closing both");
             stop(old).await;
@@ -213,6 +234,21 @@ impl Relay {
             self.refuse(&sid, reason::UNKNOWN_SERVER).await;
             return;
         };
+        // Before any limit: a refused agent must not learn whether the
+        // server is busy, nor evict an approved agent's session.
+        let credential_id = credential.as_ref().map(|c| c.id.clone());
+        let admitted = self.admission.admits(credential_id.as_deref());
+        recorder.seen(credential.as_ref(), client.as_ref(), &server, admitted);
+        if !admitted {
+            info!(
+                %sid,
+                %server,
+                credential = credential_id.as_deref().unwrap_or("none"),
+                "session refused: this agent is not approved on this machine; `webmcp approve` lets it in"
+            );
+            self.refuse(&sid, reason::APPROVAL_REQUIRED).await;
+            return;
+        }
         if entry.is_unsupported() {
             self.refuse(&sid, reason::UNSUPPORTED_MODE).await;
             return;
@@ -290,6 +326,7 @@ impl Relay {
             SessionHandle {
                 id,
                 alias: server,
+                credential: credential_id,
                 tx,
                 cancel,
                 task,
@@ -351,12 +388,13 @@ impl Relay {
         }
     }
 
-    /// The attached set changed (config hot reload). Sessions on an alias
-    /// that is gone end with `detached`, sessions on an alias whose entry
-    /// differs in any field end with `reconfigured`; every other session is
-    /// left alone. Later `session_open`s see the new set. The caller sends
-    /// the fresh `servers` frame afterwards.
-    pub async fn reconfigure(&mut self, backends: &[ServerEntry]) {
+    /// The config changed (hot reload). Sessions on an alias that is gone
+    /// end with `detached`, sessions on an alias whose entry differs in any
+    /// field end with `reconfigured`, sessions whose credential `admission`
+    /// no longer admits end with `approval_required`; every other session is
+    /// left alone. Later `session_open`s see the new set and admission. The
+    /// caller sends the fresh `servers` frame afterwards.
+    pub async fn reconfigure(&mut self, backends: &[ServerEntry], admission: &Admission) {
         let next: HashMap<String, ServerEntry> = backends
             .iter()
             .map(|e| (e.alias.clone(), e.clone()))
@@ -370,6 +408,9 @@ impl Relay {
                     Some(entry) if self.backends.get(&s.alias) != Some(entry) => {
                         Some((sid.clone(), reason::RECONFIGURED))
                     }
+                    Some(_) if !admission.admits(s.credential.as_deref()) => {
+                        Some((sid.clone(), reason::APPROVAL_REQUIRED))
+                    }
                     Some(_) => None,
                 })
                 .collect();
@@ -378,6 +419,7 @@ impl Relay {
                 .collect()
         };
         self.backends = next;
+        self.admission = admission.clone();
         for (handle, sid, why) in doomed {
             info!(%sid, server = %handle.alias, reason = why, "session ended by config reload");
             stop(handle).await;

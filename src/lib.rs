@@ -4,6 +4,7 @@
 //! integration tests can drive the connect loop against a mock gateway
 //! without spawning a process.
 
+pub mod approvals;
 pub mod config;
 pub mod connect;
 pub mod device_auth;
@@ -13,6 +14,7 @@ pub mod keys;
 pub mod lock;
 pub mod output;
 pub mod pair;
+pub mod passkey;
 pub mod platform;
 pub mod proto;
 pub mod relay;

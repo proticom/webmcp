@@ -11,9 +11,11 @@
 
 use serde::Serialize;
 
-use crate::config::{Config, ServerEntry};
+use crate::approvals::Agents;
+use crate::config::{ApprovedCredential, Config, ServerEntry};
 use crate::discover::{Definition, Discovered, Source};
-use crate::proto::{SessionMode, Transport};
+use crate::passkey::PasskeyLink;
+use crate::proto::{CredentialKind, SessionMode, Transport};
 
 /// What the human does once `up` is done.
 pub const NEXT_CONNECTOR: &str = "Paste a server URL into Claude, ChatGPT or Grok as a custom connector, sign in to webmcp.fast when asked, and click Allow.";
@@ -275,6 +277,81 @@ pub struct ServiceStatusReport {
     pub log: Option<String>,
 }
 
+/// `passkey --json`: the link to open, and for how many seconds it works.
+#[derive(Debug, Serialize)]
+pub struct PasskeyLinkReport<'a> {
+    pub event: &'static str,
+    pub url: &'a str,
+    pub expires_in: u64,
+}
+
+impl<'a> PasskeyLinkReport<'a> {
+    pub fn new(link: &'a PasskeyLink) -> Self {
+        PasskeyLinkReport {
+            event: "passkey_link",
+            url: &link.url,
+            expires_in: link.expires_in,
+        }
+    }
+}
+
+/// `approvals --json`, and the state `approvals on` and `approvals off`
+/// leave. `approved` is what is enforced: empty while approvals are off.
+#[derive(Debug, Serialize)]
+pub struct ApprovalsReport {
+    pub require_approval: bool,
+    pub approved: Vec<ApprovedCredential>,
+    pub waiting: Vec<WaitingAgent>,
+}
+
+/// An agent refused for want of approval and not approved since.
+#[derive(Debug, Serialize)]
+pub struct WaitingAgent {
+    pub id: String,
+    pub kind: CredentialKind,
+    pub name: String,
+    /// The aliases it asked for.
+    pub servers: Vec<String>,
+    pub last_seen: String,
+}
+
+impl ApprovalsReport {
+    pub fn new(cfg: &Config, agents: &Agents) -> Self {
+        let waiting = agents
+            .waiting(cfg)
+            .into_iter()
+            .map(|(id, seen)| WaitingAgent {
+                id: id.to_string(),
+                kind: seen.kind,
+                name: seen.name.clone(),
+                servers: seen.servers.clone(),
+                last_seen: seen.last_seen.clone(),
+            })
+            .collect();
+        ApprovalsReport {
+            require_approval: cfg.require_approval,
+            approved: if cfg.require_approval {
+                cfg.approved.clone()
+            } else {
+                Vec::new()
+            },
+            waiting,
+        }
+    }
+}
+
+/// `approve --json`: the credentials this run approved.
+#[derive(Debug, Serialize)]
+pub struct ApproveReport {
+    pub approved: Vec<ApprovedCredential>,
+}
+
+/// `approvals revoke --json`.
+#[derive(Debug, Serialize)]
+pub struct RevokeReport {
+    pub revoked: ApprovedCredential,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,10 +366,12 @@ mod tests {
             base_url: "https://webmcp.fast".into(),
             relay_url: "wss://webmcp.fast/connect".into(),
             hardware_id: "ab".repeat(32),
+            require_approval: false,
             servers: vec![
                 ServerEntry::stdio("github", "npx -y gh", SessionMode::PerSession).unwrap(),
                 ServerEntry::http("web", "http://localhost:3000/mcp", SessionMode::Shared).unwrap(),
             ],
+            approved: vec![],
         }
     }
 
@@ -417,6 +496,74 @@ mod tests {
         assert_eq!(
             serde_json::to_value(ErrorReport::new("error", "boom")).unwrap(),
             json!({"event": "error", "code": "error", "message": "boom"})
+        );
+    }
+
+    #[test]
+    fn approvals_report_shapes() {
+        use crate::proto::Credential;
+        use std::time::{Duration, UNIX_EPOCH};
+        let at = UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+        let agent = |id: &str, name: &str| Credential {
+            id: id.into(),
+            kind: CredentialKind::Oauth,
+            name: name.into(),
+        };
+        let mut agents = Agents::default();
+        agents.observe(
+            &agent("grt_wait", "Cursor"),
+            Some("cursor"),
+            "github",
+            false,
+            at,
+        );
+        agents.observe(
+            &agent("grt_ok", "Claude"),
+            Some("claude-ai"),
+            "web",
+            true,
+            at,
+        );
+        let mut cfg = cfg();
+        // Off: nothing is enforced and nothing waits.
+        assert_eq!(
+            serde_json::to_value(ApprovalsReport::new(&cfg, &agents)).unwrap(),
+            json!({"require_approval": false, "approved": [], "waiting": []})
+        );
+
+        cfg.require_approval = true;
+        cfg.approved = vec![ApprovedCredential {
+            id: "grt_ok".into(),
+            kind: CredentialKind::Oauth,
+            name: "Claude".into(),
+            approved_at: "2026-09-21T14:13:20Z".into(),
+        }];
+        let claude = json!({"id": "grt_ok", "kind": "oauth", "name": "Claude",
+                            "approved_at": "2026-09-21T14:13:20Z"});
+        let l = line(&ApprovalsReport::new(&cfg, &agents));
+        assert!(!l.contains('\n'));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&l).unwrap(),
+            json!({
+                "require_approval": true,
+                "approved": [claude],
+                "waiting": [{"id": "grt_wait", "kind": "oauth", "name": "Cursor",
+                             "servers": ["github"], "last_seen": "2026-09-21T14:13:20Z"}]
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ApproveReport {
+                approved: cfg.approved.clone()
+            })
+            .unwrap(),
+            json!({ "approved": [claude] })
+        );
+        assert_eq!(
+            serde_json::to_value(RevokeReport {
+                revoked: cfg.approved[0].clone()
+            })
+            .unwrap(),
+            json!({ "revoked": claude })
         );
     }
 }

@@ -103,6 +103,47 @@ key: a different machine that learns the `user_code` gains nothing. If the
 human chose a different device name on the approval page, the `200` body's
 `device_name` is authoritative. Polling starts after one full `interval`.
 
+## 1b. Adding a passkey from the device
+
+Once an account has a paired device, its first passkey, and any passkey added
+without an existing one (recovery), must be started from that device. The
+daemon proves it holds the device key (`webmcp passkey`):
+
+```
+POST https://webmcp.fast/api/v1/device/passkey-link
+Content-Type: application/json
+User-Agent: webmcp-daemon/<version> (<platform>)
+
+{ "device_id": "dev_…", "ts": 1790000000, "signature": "<base64, 64 bytes>" }
+```
+
+`ts` is the daemon's clock in Unix seconds, a JSON number. The signature is
+Ed25519, made with the device key, over the UTF-8 bytes of:
+
+```
+"webmcp-passkey-link-v1\n" + device_id + "\n" + ts
+```
+
+where `ts` is written in decimal exactly as sent. The gateway rejects a `ts`
+more than 300 s away from its own clock, either way.
+
+| Status | Body | Meaning |
+|---|---|---|
+| 201 | `{"url":"https://…","expires_in":600}` | Open `url` in a browser within `expires_in` seconds. |
+| 400 | `{"error":"invalid_request","message":"…"}` | Malformed body. |
+| 401 | `{"error":"bad_signature"}` | The signature does not verify against the device's public key. |
+| 400 | `{"error":"clock_skew"}` | `ts` is more than 300 s off. |
+| 404 | `{"error":"unknown_device"}` | Unknown or revoked device. |
+| 429 | `{"error":"rate_limited"}` | Too many links asked for. |
+
+Every error body may carry a `message`. The daemon reports the `error` code
+whatever the status, and treats a `429` without a JSON body as
+`rate_limited`.
+
+The link works once, for 10 minutes, and only for a signed-in user who can
+manage that device's handle. It lets that browser add a passkey without an
+existing one.
+
 ## 2. Relay connection
 
 ```
@@ -154,14 +195,14 @@ Implemented now:
 
 | Frame | Direction | Purpose |
 |---|---|---|
-| `{"t":"servers","servers":[{"alias":"gnosys","transport":"stdio"\|"http","mode":"per-session"\|"shared"\|"exclusive","status":"ready"\|"error","error":"…"?}]}` | daemon → gateway | Sent on connect and whenever the attached set changes. The gateway keeps only the first 200 entries. |
+| `{"t":"servers","servers":[{"alias":"gnosys","transport":"stdio"\|"http","mode":"per-session"\|"shared"\|"exclusive","status":"ready"\|"error","error":"…"?}],"require_approval":true?}` | daemon → gateway | Sent on connect and again whenever the attached set or the device's approvals change. A repeat with nothing new in it is harmless. The gateway keeps only the first 200 entries. `require_approval` is sent only as `true`, while the device approves new agents itself (see *Local approval of new agents*). Absent means `false`. |
 | `{"t":"error","code":"…","message":"…"?}` | either | Non-fatal unless followed by close. |
 
 MCP relay (the daemon must still ignore unknown `t` values):
 
 | Frame | Direction | Purpose |
 |---|---|---|
-| `{"t":"session_open","sid":"ses_…","server":"gnosys","client":{"name":"…","version":"…"}}` | gateway → daemon | An agent harness sent `initialize` to `/<device>/<server>/mcp`. `client` is its `clientInfo`, truncated. |
+| `{"t":"session_open","sid":"ses_…","server":"gnosys","client":{"name":"…","version":"…"},"credential":{"id":"grt_…","kind":"oauth"\|"token","name":"…"}?}` | gateway → daemon | An agent harness sent `initialize` to `/<device>/<server>/mcp`. `client` is its `clientInfo`, truncated. `credential` is the credential the request carried: an OAuth grant (`oauth`, `name` is the agent's name) or a connector token (`token`, `name` is its label). Its `id` stays the same for the life of the credential, for example `grt_…` or `ctk_…`. Older gateways omit `credential`. |
 | `{"t":"session_close","sid":"ses_…","reason":"…"}` | either | Session ended. |
 | `{"t":"mcp","sid":"ses_…","msg":{…JSON-RPC…}}` | either | One JSON-RPC message, verbatim, for that session. |
 | `{"t":"detach","alias":"gnosys"}` | gateway → daemon | The owner removed this server on the dashboard. The daemon drops the alias from its config, which ends its sessions (`detached`) and produces a fresh `servers` frame. An unknown alias is ignored. There is deliberately no `attach` counterpart. |
@@ -182,10 +223,13 @@ session on a server at its session cap, closed to admit a new one; its client
 gets `404` and initializes again), `unsupported_mode`,
 `spawn_failed: <detail>`, `server_exited`, `idle`, `message_too_large`,
 `overloaded` (its 256-message session queue filled), `duplicate_session`,
-and `unknown_session` (an `mcp` frame for a `sid` it does not hold, which
-can cross with its own close; the gateway ignores closes for sessions it no
-longer tracks), and after a config reload `detached` (alias removed) or
-`reconfigured` (its definition changed). From the gateway: `client_closed`
+`unknown_session` (an `mcp` frame for a `sid` it does not hold, which can
+cross with its own close; the gateway ignores closes for sessions it no
+longer tracks), and `approval_required` (the device approves new agents
+itself and this credential is not approved there, or `session_open` carried
+no `credential`). After a config reload: `detached` (alias removed),
+`reconfigured` (its definition changed) or `approval_required` (its
+credential is no longer approved, or approvals were just turned on). From the gateway: `client_closed`
 (HTTP `DELETE`), `token_revoked`, `idle` (24 h without a request), and from
 the dashboard `restart`, `server_disabled`, `server_removed`. Neither side replies to a `session_close`.
 
@@ -222,3 +266,22 @@ preference is on. A policy, once set, survives detach and re-attach. The plan
 limit counts enabled servers that are currently advertised, per device.
 `{"t":"error","code":"server_limit"}` after a `servers` frame names the
 aliases held back by that limit.
+
+### Local approval of new agents
+
+The owner can make a device approve new agents itself (`webmcp approvals
+on`). The setting and the list of approved credential ids live only in the
+device's config. No frame reads or changes either, so the gateway cannot turn
+it off. While it is on:
+
+- A `session_open` whose `credential.id` is not approved on the device, or
+  that carries no `credential`, gets `session_close` with reason
+  `approval_required`. No backend starts for it.
+- When an approval is withdrawn, or approvals are turned on, every live
+  session whose credential is not approved ends with `approval_required`.
+- The `servers` frame carries `"require_approval":true`.
+
+The owner approves a waiting credential on the device (`webmcp approve`), and
+its next `session_open` succeeds. On `approval_required` the gateway should
+tell the agent's owner to run `webmcp approve` on that device. It cannot
+approve anything itself.

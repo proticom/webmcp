@@ -1,10 +1,11 @@
-//! Config hot-reload: while `webmcp connect` runs, `attach` and `detach`
-//! edit `config.toml` and the running daemon follows along.
+//! Config hot-reload: while `webmcp connect` runs, `attach`, `detach`,
+//! `approve` and `approvals` edit `config.toml` and the running daemon
+//! follows along.
 //!
 //! No file-watcher dependency: the file's mtime and length are polled. The
-//! [`ConfigWatcher`] is owned by the reconnect loop, so the attached set it
-//! holds outlives any one connection and is the source of truth for what a
-//! reconnect advertises.
+//! [`ConfigWatcher`] is owned by the reconnect loop, so the attached set and
+//! admission it holds outlive any one connection and are the source of truth
+//! for what a reconnect advertises and enforces.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -13,6 +14,7 @@ use ed25519_dalek::VerifyingKey;
 use tokio::time::{Interval, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
+use crate::approvals::Admission;
 use crate::config::{Config, ServerEntry};
 use crate::keys;
 use crate::proto::ServerInfo;
@@ -51,7 +53,8 @@ pub struct Pairing {
     pub verifying_key: VerifyingKey,
 }
 
-/// The current attached set, refreshed from the config file on a poll.
+/// The current attached set and admission, refreshed from the config file
+/// on a poll.
 pub struct ConfigWatcher {
     /// `None` disables reloading: the set stays what it was seeded with.
     path: Option<PathBuf>,
@@ -63,18 +66,20 @@ pub struct ConfigWatcher {
     retry: bool,
     entries: Vec<ServerEntry>,
     infos: Vec<ServerInfo>,
+    admission: Admission,
 }
 
 impl ConfigWatcher {
-    /// Seed with the startup set. `infos` is what gets advertised until a
-    /// reload replaces it (tests advertise sets with no backends behind
-    /// them).
+    /// Seed with the startup set and admission. `infos` is what gets
+    /// advertised until a reload replaces it (tests advertise sets with no
+    /// backends behind them).
     pub fn new(
         path: Option<PathBuf>,
         interval: Duration,
         pairing: Pairing,
         entries: Vec<ServerEntry>,
         infos: Vec<ServerInfo>,
+        admission: Admission,
     ) -> Self {
         let mut ticker = tokio::time::interval(interval.max(Duration::from_millis(1)));
         // Ticks pile up while the daemon is between connections.
@@ -87,6 +92,7 @@ impl ConfigWatcher {
             retry: false,
             entries,
             infos,
+            admission,
         }
     }
 
@@ -100,8 +106,13 @@ impl ConfigWatcher {
         &self.infos
     }
 
-    /// Resolves the next time the attached set changes; never when
-    /// reloading is disabled. Cancel safe: a change is recorded in `self`
+    /// Which credentials may open sessions right now.
+    pub fn admission(&self) -> &Admission {
+        &self.admission
+    }
+
+    /// Resolves the next time the attached set or the admission changes;
+    /// never when reloading is disabled. Cancel safe: a change is recorded in `self`
     /// in the same step that detects it, never across an await.
     pub async fn changed(&mut self) {
         if self.path.is_none() {
@@ -115,8 +126,9 @@ impl ConfigWatcher {
         }
     }
 
-    /// Look at the file once. True when the attached set changed. The file
-    /// is small and local, so this reads it on the calling task.
+    /// Look at the file once. True when the attached set or the admission
+    /// changed. The file is small and local, so this reads it on the calling
+    /// task.
     pub fn poll(&mut self) -> bool {
         let Some(path) = self.path.as_deref() else {
             return false;
@@ -144,15 +156,18 @@ impl ConfigWatcher {
         };
         self.retry = false;
         self.check_pairing(path, &cfg);
-        if cfg.servers == self.entries {
+        let admission = cfg.admission();
+        if cfg.servers == self.entries && admission == self.admission {
             return false;
         }
         info!(
             servers = cfg.servers.len(),
-            "config changed; reloading servers"
+            require_approval = admission.required(),
+            "config changed; reloading servers and approvals"
         );
         self.infos = cfg.server_infos();
         self.entries = cfg.servers;
+        self.admission = admission;
         true
     }
 
@@ -192,7 +207,9 @@ mod tests {
             base_url: "https://webmcp.fast".into(),
             relay_url: "wss://webmcp.fast/connect".into(),
             hardware_id: "ab".repeat(32),
+            require_approval: false,
             servers,
+            approved: vec![],
         }
     }
 
@@ -207,6 +224,7 @@ mod tests {
             },
             cfg.servers.clone(),
             cfg.server_infos(),
+            cfg.admission(),
         )
     }
 
@@ -247,6 +265,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_follows_approvals_and_ignores_what_they_do_not_enforce() {
+        use crate::config::ApprovedCredential;
+        use crate::proto::CredentialKind;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(vec![]);
+        cfg.save_to(dir.path()).unwrap();
+        let mut w = watcher(dir.path(), &cfg);
+        assert!(!w.poll());
+        let approval = |id: &str| ApprovedCredential {
+            id: id.into(),
+            kind: CredentialKind::Token,
+            name: "ci".into(),
+            approved_at: "2026-09-21T14:13:20Z".into(),
+        };
+
+        // An approval nobody enforces yet is not a change.
+        cfg.approved.push(approval("ctk_1"));
+        cfg.save_to(dir.path()).unwrap();
+        assert!(!w.poll());
+        assert_eq!(w.admission(), &Admission::Open);
+
+        cfg.require_approval = true;
+        cfg.save_to(dir.path()).unwrap();
+        assert!(w.poll());
+        assert_eq!(
+            w.admission(),
+            &Admission::Approved(["ctk_1".to_string()].into())
+        );
+
+        cfg.approved.push(approval("ctk_2"));
+        cfg.save_to(dir.path()).unwrap();
+        assert!(w.poll());
+        assert!(w.admission().admits(Some("ctk_2")));
+
+        cfg.require_approval = false;
+        cfg.approved.clear();
+        cfg.save_to(dir.path()).unwrap();
+        assert!(w.poll());
+        assert_eq!(w.admission(), &Admission::Open);
+        assert!(w.entries().is_empty());
+    }
+
+    #[tokio::test]
     async fn disabled_without_a_path() {
         let cfg = config(vec![]);
         let mut w = ConfigWatcher::new(
@@ -259,6 +320,7 @@ mod tests {
             },
             vec![],
             vec![],
+            Admission::Open,
         );
         assert!(!w.poll());
         let waited = tokio::time::timeout(Duration::from_millis(50), w.changed()).await;

@@ -51,7 +51,13 @@ pub enum Frame {
         server_time: String,
     },
     /// daemon → gateway: attached servers, on connect and on every change.
-    Servers { servers: Vec<ServerInfo> },
+    Servers {
+        servers: Vec<ServerInfo>,
+        /// The device approves new agents itself (`webmcp approvals on`).
+        /// Sent only when true.
+        #[serde(default, skip_serializing_if = "is_false")]
+        require_approval: bool,
+    },
     /// either direction: non-fatal unless followed by a close.
     Error {
         code: String,
@@ -64,6 +70,13 @@ pub enum Frame {
         server: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client: Option<ClientInfo>,
+        /// The agent credential behind the request. Older gateways omit it.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "lenient_credential"
+        )]
+        credential: Option<Credential>,
     },
     /// either direction (M2): session ended.
     SessionClose {
@@ -120,6 +133,52 @@ pub struct ClientInfo {
     pub version: Option<String>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// The agent credential a `session_open` came in with: an OAuth grant or a
+/// connector token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Credential {
+    /// Stable for the life of the credential, e.g. `grt_…` or `ctk_…`.
+    pub id: String,
+    pub kind: CredentialKind,
+    /// The agent's name (OAuth) or the token's label.
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CredentialKind {
+    Oauth,
+    Token,
+    /// A kind a newer gateway sends that this daemon does not know. The
+    /// credential can still be recorded and approved by its id.
+    #[serde(other)]
+    Other,
+}
+
+impl std::fmt::Display for CredentialKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(match self {
+            CredentialKind::Oauth => "oauth",
+            CredentialKind::Token => "token",
+            CredentialKind::Other => "other",
+        })
+    }
+}
+
+/// A malformed `credential` reads as none. It must not cost a session that
+/// does not need it; with approvals on, a session without one is refused.
+fn lenient_credential<'de, D>(deserializer: D) -> Result<Option<Credential>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(raw.and_then(|v| serde_json::from_value(v).ok()))
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// One attached server as advertised in the `servers` frame.
@@ -217,6 +276,55 @@ mod tests {
             f.to_json().unwrap(),
             r#"{"t":"error","code":"unauthorized"}"#
         );
+    }
+
+    #[test]
+    fn require_approval_is_sent_only_when_true() {
+        let servers = |require_approval| Frame::Servers {
+            servers: vec![],
+            require_approval,
+        };
+        assert_eq!(
+            servers(false).to_json().unwrap(),
+            r#"{"t":"servers","servers":[]}"#
+        );
+        assert_eq!(
+            servers(true).to_json().unwrap(),
+            r#"{"t":"servers","servers":[],"require_approval":true}"#
+        );
+        assert_eq!(
+            Frame::from_json(r#"{"t":"servers","servers":[]}"#).unwrap(),
+            servers(false)
+        );
+    }
+
+    #[test]
+    fn session_open_credential_reads_leniently() {
+        let open = |credential: &str| {
+            let text = format!(r#"{{"t":"session_open","sid":"ses_1","server":"fs"{credential}}}"#);
+            match Frame::from_json(&text).unwrap() {
+                Frame::SessionOpen { credential, .. } => credential,
+                other => panic!("expected session_open, got {other:?}"),
+            }
+        };
+        assert_eq!(open(""), None);
+        assert_eq!(
+            open(r#","credential":{"id":"ctk_1","kind":"token","name":"ci"}"#),
+            Some(Credential {
+                id: "ctk_1".into(),
+                kind: CredentialKind::Token,
+                name: "ci".into(),
+            })
+        );
+        // A kind from a newer gateway still names a credential.
+        assert_eq!(
+            open(r#","credential":{"id":"x_1","kind":"robot","name":"r"}"#).map(|c| c.kind),
+            Some(CredentialKind::Other)
+        );
+        // Garbage costs the credential, never the session.
+        assert_eq!(open(r#","credential":{"kind":"oauth"}"#), None);
+        assert_eq!(open(r#","credential":"grt_1""#), None);
+        assert_eq!(open(r#","credential":null"#), None);
     }
 
     #[test]

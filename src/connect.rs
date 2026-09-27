@@ -1,7 +1,7 @@
 //! The relay connection: handshake, keep-alive and reconnect loop
 //! (protocol §2).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -17,6 +17,7 @@ use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::{debug, info, warn};
 
+use crate::approvals::{Admission, Recorder};
 use crate::config::ServerEntry;
 use crate::keys;
 use crate::platform;
@@ -56,10 +57,17 @@ pub struct ConnectOptions {
     /// The servers actually relayed, looked up by alias on `session_open`.
     /// With `config_path` this is only the startup set.
     pub backends: Vec<ServerEntry>,
-    /// Config file whose `servers` list is followed while connected
-    /// (`attach`/`detach` take effect without a restart). `None` keeps the
-    /// set above for good.
+    /// Which agent credentials may open sessions. With `config_path` this is
+    /// only the startup admission.
+    pub admission: Admission,
+    /// Config file whose `servers` list and approvals are followed while
+    /// connected (`attach`/`detach`/`approve` take effect without a
+    /// restart), and next to which `agents.json` records the agents seen.
+    /// `None` keeps the set and admission above for good.
     pub config_path: Option<PathBuf>,
+    /// Desktop notification when an agent waits for approval. Off unless the
+    /// CLI turns it on, so a library user or a test never pops one.
+    pub notify: bool,
     /// How often `config_path` is checked for changes.
     pub config_poll_interval: Duration,
     /// Session limits and timeouts for the relay.
@@ -86,7 +94,9 @@ impl ConnectOptions {
             signing_key,
             servers: Vec::new(),
             backends: Vec::new(),
+            admission: Admission::Open,
             config_path: None,
+            notify: false,
             config_poll_interval: DEFAULT_POLL_INTERVAL,
             relay: RelayOptions::default(),
             once: false,
@@ -127,7 +137,17 @@ impl ConnectOptions {
             },
             self.backends.clone(),
             self.servers.clone(),
+            self.admission.clone(),
         )
+    }
+
+    /// Records the credentials the gateway presents in `agents.json` next to
+    /// `config_path`. One recorder spans every reconnect of [`run`], so a
+    /// waiting agent notifies at most once per ten minutes, not once per
+    /// connection.
+    fn recorder(&self) -> Recorder {
+        let dir = self.config_path.as_deref().and_then(Path::parent);
+        Recorder::new(dir.map(Path::to_path_buf), self.notify)
     }
 
     fn write_timeout(&self) -> Duration {
@@ -198,8 +218,9 @@ pub async fn run(opts: &ConnectOptions) -> Result<Welcome, ConnectError> {
     // Owned here, not by a connection: a reconnect advertises the set as
     // last reloaded, not the startup one.
     let mut watcher = opts.watcher();
+    let mut recorder = opts.recorder();
     loop {
-        match connection(opts, &mut watcher).await {
+        match connection(opts, &mut watcher, &mut recorder).await {
             Ok(w) if opts.once => return Ok(w),
             Ok(_) => {
                 // Session ended cleanly (e.g. gateway restart): reconnect
@@ -234,12 +255,13 @@ pub fn backoff_delay(opts: &ConnectOptions, attempt: u32) -> Duration {
 /// One connection: dial, handshake, advertise servers, keep alive until the
 /// connection ends. With `once`, returns right after the first pong.
 pub async fn session(opts: &ConnectOptions) -> Result<Welcome, ConnectError> {
-    connection(opts, &mut opts.watcher()).await
+    connection(opts, &mut opts.watcher(), &mut opts.recorder()).await
 }
 
 async fn connection(
     opts: &ConnectOptions,
     watcher: &mut ConfigWatcher,
+    recorder: &mut Recorder,
 ) -> Result<Welcome, ConnectError> {
     let url = opts.dial_url()?;
     let mut request = url.as_str().into_client_request()?;
@@ -276,13 +298,27 @@ async fn connection(
     // Catch up on edits made while disconnected, so the first `servers`
     // frame is already current.
     watcher.poll();
-    let mut relay = Relay::new(watcher.entries(), opts.relay.clone(), out.clone());
+    let mut relay = Relay::new(
+        watcher.entries(),
+        watcher.admission().clone(),
+        opts.relay.clone(),
+        out.clone(),
+    );
 
     let result = async {
         if !advertise(&out, watcher).await? {
             return Err(writer_error(&mut writer).await);
         }
-        keepalive(&mut stream, &out, &mut writer, &mut relay, watcher, opts).await
+        keepalive(
+            &mut stream,
+            &out,
+            &mut writer,
+            &mut relay,
+            watcher,
+            recorder,
+            opts,
+        )
+        .await
     }
     .await;
 
@@ -309,6 +345,7 @@ async fn advertise(
 ) -> Result<bool, ConnectError> {
     let servers = Frame::Servers {
         servers: watcher.infos().to_vec(),
+        require_approval: watcher.admission().required(),
     };
     Ok(out.send(Message::text(servers.to_json()?)).await.is_ok())
 }
@@ -423,6 +460,7 @@ async fn keepalive(
     writer: &mut JoinHandle<Result<(), ConnectError>>,
     relay: &mut Relay,
     watcher: &mut ConfigWatcher,
+    recorder: &mut Recorder,
     opts: &ConnectOptions,
 ) -> Result<(), ConnectError> {
     let mut ticker = tokio::time::interval(opts.ping_interval);
@@ -454,7 +492,7 @@ async fn keepalive(
             _ = watcher.changed() => {
                 // Affected sessions close first, then the new set goes out,
                 // in that order on the wire.
-                relay.reconfigure(watcher.entries()).await;
+                relay.reconfigure(watcher.entries(), watcher.admission()).await;
                 for s in watcher.infos().iter().filter(|s| s.error.is_some()) {
                     warn!(server = %s.alias, "{}", s.error.as_deref().unwrap_or(""));
                 }
@@ -480,7 +518,7 @@ async fn keepalive(
                         }
                     }
                     Incoming::Text(t) => debug!(text = %t, "ignoring non-JSON text frame"),
-                    Incoming::Frame(frame) => handle_frame(frame, relay, opts).await,
+                    Incoming::Frame(frame) => handle_frame(frame, relay, recorder, opts).await,
                     Incoming::Oversized(sid) => relay.oversized(sid).await,
                     Incoming::Closed(e) => return Err(e),
                 }
@@ -490,7 +528,12 @@ async fn keepalive(
 }
 
 /// Post-welcome frame dispatch: session frames go to the relay.
-async fn handle_frame(frame: Frame, relay: &mut Relay, opts: &ConnectOptions) {
+async fn handle_frame(
+    frame: Frame,
+    relay: &mut Relay,
+    recorder: &mut Recorder,
+    opts: &ConnectOptions,
+) {
     match frame {
         Frame::Error { code, message } => {
             warn!(%code, message = message.as_deref().unwrap_or(""), "gateway error");
@@ -499,7 +542,8 @@ async fn handle_frame(frame: Frame, relay: &mut Relay, opts: &ConnectOptions) {
             sid,
             server,
             client,
-        } => relay.open(sid, server, client).await,
+            credential,
+        } => relay.open(sid, server, client, credential, recorder).await,
         Frame::SessionClose { sid, reason } => relay.close(&sid, reason.as_deref()).await,
         Frame::Mcp { sid, msg } => relay.deliver(sid, msg).await,
         Frame::Detach { alias } => remote_detach(&alias, opts),

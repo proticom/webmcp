@@ -2,6 +2,7 @@
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -15,8 +16,9 @@ use webmcp_daemon::discover::{self, Discovered, Roots};
 use webmcp_daemon::lock::{InstanceLock, LockError};
 use webmcp_daemon::output::{self, ServiceOutcome, UpEvent, UpReport};
 use webmcp_daemon::pair::{self, PairError, PairRequest};
+use webmcp_daemon::passkey::{self, PasskeyError};
 use webmcp_daemon::proto::SessionMode;
-use webmcp_daemon::{keys, platform, service, Error};
+use webmcp_daemon::{approvals, keys, platform, service, Error};
 
 const DEFAULT_BASE_URL: &str = "https://webmcp.fast";
 
@@ -29,10 +31,11 @@ const DEFAULT_BASE_URL: &str = "https://webmcp.fast";
 )]
 struct Cli {
     /// Machine-readable output for up, discover, status, servers, attach,
-    /// detach and service status: one JSON object on stdout (logs stay on
-    /// stderr). `up` prints one extra `approval_required` line first when it
-    /// has to pair. Other commands emit JSON only on error. Exit codes: 0 ok,
-    /// 1 error, 2 approval declined, 3 approval expired
+    /// detach, approvals, approve, passkey and service status: one JSON
+    /// object on stdout (logs stay on stderr), and nothing ever prompts. `up` prints one
+    /// extra `approval_required` line first when it has to pair. Other
+    /// commands emit JSON only on error. Exit codes: 0 ok, 1 error, 2
+    /// approval declined, 3 approval expired
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
@@ -58,11 +61,65 @@ enum Command {
     Detach { alias: String },
     /// List attached servers
     Servers,
+    /// Show whether a new agent needs approval on this machine, or change it
+    Approvals {
+        #[command(subcommand)]
+        action: Option<ApprovalsAction>,
+    },
+    /// Approve agents waiting to use this machine
+    Approve(ApproveArgs),
+    /// Get a one-time link that lets your browser add a passkey, proven by
+    /// this machine's device key
+    Passkey(PasskeyArgs),
     /// Keep the daemon running in the background (macOS launchd, Linux systemd)
     Service {
         #[command(subcommand)]
         action: ServiceAction,
     },
+}
+
+#[derive(Subcommand)]
+enum ApprovalsAction {
+    /// A new agent needs `webmcp approve` here before it can use this machine
+    On(OnArgs),
+    /// Any agent the owner connects on webmcp.fast can use this machine
+    Off,
+    /// Withdraw an approval; that agent's live sessions end
+    Revoke {
+        /// Credential id, as `webmcp approvals` lists it
+        id: String,
+    },
+}
+
+#[derive(Args)]
+struct PasskeyArgs {
+    /// Do not try to open the link in the default browser
+    #[arg(long)]
+    no_browser: bool,
+}
+
+#[derive(Args)]
+struct OnArgs {
+    /// Approve the agents that already connected to this machine without
+    /// asking (what happens anyway without a terminal)
+    #[arg(long, conflicts_with = "no_keep_existing")]
+    keep_existing: bool,
+    /// Approve none of them, without asking: each then needs `webmcp approve`
+    #[arg(long)]
+    no_keep_existing: bool,
+}
+
+#[derive(Args)]
+#[command(after_help = "Examples:\n  \
+    webmcp approve                 # list the waiting agents and pick\n  \
+    webmcp approve grt_abc ctk_def # approve these by id\n  \
+    webmcp approve --all --json    # every waiting agent, no prompt")]
+struct ApproveArgs {
+    /// Credential ids to approve, as `webmcp approvals` lists them
+    ids: Vec<String>,
+    /// Approve every waiting agent
+    #[arg(long, conflicts_with = "ids")]
+    all: bool,
 }
 
 #[derive(Subcommand)]
@@ -167,9 +224,12 @@ fn main() {
         Err(e) => {
             let message = format!("{e:#}");
             if json {
+                let code = e
+                    .downcast_ref::<PasskeyError>()
+                    .map_or("error", PasskeyError::code);
                 println!(
                     "{}",
-                    output::line(&output::ErrorReport::new("error", &message))
+                    output::line(&output::ErrorReport::new(code, &message))
                 );
             }
             eprintln!("error: {message}");
@@ -201,6 +261,9 @@ fn run(cli: Cli) -> Result<i32> {
         Command::Attach(args) => attach(dir, args, json)?,
         Command::Detach { alias } => detach(dir, &alias, json)?,
         Command::Servers => servers(dir, json)?,
+        Command::Approvals { action } => approvals_cmd(&dir, action, json)?,
+        Command::Approve(args) => approve_cmd(&dir, args, json)?,
+        Command::Passkey(args) => runtime()?.block_on(passkey_cmd(&dir, args, json))?,
         Command::Service { action } => service_cmd(action, json)?,
     }
     Ok(0)
@@ -286,8 +349,7 @@ async fn login(dir: PathBuf, args: LoginArgs) -> Result<()> {
         Err(e) => return Err(e.into()),
     };
 
-    let servers = existing.map(|c| c.servers).unwrap_or_default();
-    let cfg = pair::persist(&dir, &key, resp, device_name, hardware_id, servers)?;
+    let cfg = pair::persist(&dir, &key, resp, device_name, hardware_id, existing)?;
 
     println!(
         "Paired as {}/{} (device id {}).",
@@ -308,6 +370,12 @@ fn say(json: bool, text: impl AsRef<str>) {
     }
 }
 
+/// A person can answer a prompt. An agent on a pipe, or anything asking for
+/// JSON, must never be left waiting on one.
+fn at_terminal(json: bool) -> bool {
+    !json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
 /// Ask on the terminal; any read failure is an empty answer.
 fn prompt(question: &str) -> String {
     print!("{question}");
@@ -318,8 +386,13 @@ fn prompt(question: &str) -> String {
 }
 
 /// Best effort: a headless box or a missing `xdg-open` is not an error, the
-/// link is printed either way.
+/// link is printed either way. Links come from the gateway, and the opener
+/// would launch whatever app claims another scheme, so only web links go.
 fn open_in_browser(link: &str) {
+    if !(link.starts_with("https://") || link.starts_with("http://")) {
+        tracing::warn!(link, "not opening a link that is not a web address");
+        return;
+    }
     let opener = if cfg!(target_os = "macos") {
         "open"
     } else if cfg!(target_os = "linux") {
@@ -356,8 +429,7 @@ struct UpState {
 /// `webmcp up`: pair, offer servers, offer the service, report. Each step is
 /// skipped when already done, so running it again is always safe.
 async fn up(dir: PathBuf, args: UpArgs, json: bool) -> Result<i32> {
-    // An agent on a pipe must never be left waiting on a prompt.
-    let interactive = !json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let interactive = at_terminal(json);
     let mut state = UpState {
         cfg: None,
         carried: Vec::new(),
@@ -580,8 +652,7 @@ async fn up_pair(
     }
 
     let resp = device_auth::wait(base_url, &started, &device_name, PollTiming::default()).await?;
-    let servers = existing.map(|c| c.servers).unwrap_or_default();
-    let cfg = pair::persist(dir, &key, resp, device_name, hardware_id, servers)?;
+    let cfg = pair::persist(dir, &key, resp, device_name, hardware_id, existing)?;
     say(
         json,
         format!(
@@ -700,8 +771,10 @@ async fn connect_cmd(dir: PathBuf, args: ConnectArgs) -> Result<()> {
     let _lock = InstanceLock::acquire(&dir)?;
     let mut opts = ConnectOptions::new(cfg.relay_url.clone(), cfg.device_id.clone(), key);
     opts.serve(&cfg.servers);
+    opts.admission = cfg.admission();
+    opts.notify = std::env::var_os(approvals::NO_NOTIFY_ENV).is_none();
     opts.once = args.once;
-    // `attach` and `detach` edit this file while we run; follow it.
+    // `attach`, `detach` and `approve` edit this file while we run; follow it.
     opts.config_path = Some(Config::path_in(&dir));
     for s in opts.servers.iter().filter(|s| s.error.is_some()) {
         tracing::warn!(server = %s.alias, "{}", s.error.as_deref().unwrap_or(""));
@@ -711,6 +784,7 @@ async fn connect_cmd(dir: PathBuf, args: ConnectArgs) -> Result<()> {
         device = %cfg.device_name,
         relay = %cfg.relay_url,
         servers = opts.servers.len(),
+        require_approval = cfg.require_approval,
         "connecting"
     );
 
@@ -1000,6 +1074,277 @@ fn servers(dir: PathBuf, json: bool) -> Result<()> {
             s.mode,
             s.target()
         );
+    }
+    Ok(())
+}
+
+/// Printed by `approvals on`: what it buys, and what it costs.
+const APPROVALS_GAIN: &str =
+    "On: a stolen webmcp.fast account cannot add an agent to this machine.";
+const APPROVALS_COST: &str = "Cost: each new agent needs `webmcp approve` here once, and approvals can only be turned off here.";
+
+fn load_agents(dir: &Path) -> Result<approvals::Agents> {
+    approvals::Agents::load_from(dir)
+        .with_context(|| format!("reading {}", approvals::Agents::path_in(dir).display()))
+}
+
+/// An agent's name as shown; the gateway may send an empty one.
+fn shown(name: &str) -> &str {
+    if name.is_empty() {
+        "(unnamed)"
+    } else {
+        name
+    }
+}
+
+fn approvals_cmd(dir: &Path, action: Option<ApprovalsAction>, json: bool) -> Result<()> {
+    match action {
+        None => approvals_status(dir, json),
+        Some(ApprovalsAction::On(args)) => approvals_on(dir, &args, json),
+        Some(ApprovalsAction::Off) => approvals_off(dir, json),
+        Some(ApprovalsAction::Revoke { id }) => approvals_revoke(dir, &id, json),
+    }
+}
+
+fn approvals_report(dir: &Path) -> Result<output::ApprovalsReport> {
+    Ok(output::ApprovalsReport::new(
+        &load_config(dir)?,
+        &load_agents(dir)?,
+    ))
+}
+
+fn approvals_status(dir: &Path, json: bool) -> Result<()> {
+    let report = approvals_report(dir)?;
+    if json {
+        println!("{}", output::line(&report));
+        return Ok(());
+    }
+    if !report.require_approval {
+        println!(
+            "Approvals: off. Any agent the owner connects on webmcp.fast can use this machine."
+        );
+        println!("`webmcp approvals on` changes that. {APPROVALS_GAIN}");
+        return Ok(());
+    }
+    println!(
+        "Approvals: on. A new agent needs `webmcp approve` here before it can use this machine."
+    );
+    let names = report.approved.iter().map(|a| shown(&a.name));
+    let names = names.chain(report.waiting.iter().map(|w| shown(&w.name)));
+    let width = names.map(|n| n.chars().count()).max().unwrap_or(0).min(24);
+    println!();
+    if report.approved.is_empty() {
+        println!("Approved: none.");
+    } else {
+        println!("Approved:");
+        for a in &report.approved {
+            println!(
+                "  {:<width$}  {:<5}  {}  approved {}",
+                shown(&a.name),
+                a.kind,
+                a.id,
+                a.approved_at
+            );
+        }
+    }
+    println!();
+    if report.waiting.is_empty() {
+        println!("Waiting: none.");
+        return Ok(());
+    }
+    println!("Waiting:");
+    for w in &report.waiting {
+        println!(
+            "  {:<width$}  {:<5}  {}  wants {}; last seen {}",
+            shown(&w.name),
+            w.kind,
+            w.id,
+            w.servers.join(", "),
+            w.last_seen
+        );
+    }
+    println!();
+    println!("Approve with `webmcp approve <id>`, or `webmcp approve` to pick from the list.");
+    Ok(())
+}
+
+fn approvals_on(dir: &Path, args: &OnArgs, json: bool) -> Result<()> {
+    if load_config(dir)?.require_approval {
+        say(json, "Approvals are already on.");
+        if json {
+            println!("{}", output::line(&approvals_report(dir)?));
+        }
+        return Ok(());
+    }
+    let agents = load_agents(dir)?;
+    let existing = agents.already_connected();
+    let keep = if args.no_keep_existing {
+        false
+    } else if args.keep_existing || existing.is_empty() || !at_terminal(json) {
+        true
+    } else {
+        println!("Agents that already connected to this machine:");
+        for (id, seen) in &existing {
+            println!(
+                "  {} ({}, {}), last seen {}",
+                shown(&seen.name),
+                seen.kind,
+                id,
+                seen.last_seen
+            );
+        }
+        let question = match existing.len() {
+            1 => "Keep the agent that already connected to this machine? [Y/n] ".to_string(),
+            n => format!("Keep the {n} agents that already connected to this machine? [Y/n] "),
+        };
+        matches!(
+            prompt(&question).to_ascii_lowercase().as_str(),
+            "" | "y" | "yes"
+        )
+    };
+    let kept: Vec<String> = if keep {
+        existing.iter().map(|(id, _)| id.to_string()).collect()
+    } else {
+        Vec::new()
+    };
+    if approvals::turn_on(dir, &kept, SystemTime::now())? {
+        let summary = match kept.len() {
+            0 => "No agent is approved yet.".to_string(),
+            1 => "The agent that already connected stays approved.".to_string(),
+            n => format!("The {n} agents that already connected stay approved."),
+        };
+        say(json, format!("Approvals are on. {summary}"));
+        say(json, APPROVALS_GAIN);
+        say(json, APPROVALS_COST);
+    } else {
+        say(json, "Approvals are already on.");
+    }
+    if json {
+        println!("{}", output::line(&approvals_report(dir)?));
+    }
+    Ok(())
+}
+
+fn approvals_off(dir: &Path, json: bool) -> Result<()> {
+    let state = if approvals::turn_off(dir)? {
+        "Approvals are off and the approved list is cleared."
+    } else {
+        "Approvals are already off."
+    };
+    say(
+        json,
+        format!("{state} New agents work as soon as the owner connects them on webmcp.fast."),
+    );
+    if json {
+        println!("{}", output::line(&approvals_report(dir)?));
+    }
+    Ok(())
+}
+
+fn approvals_revoke(dir: &Path, id: &str, json: bool) -> Result<()> {
+    let revoked = approvals::revoke(dir, id)?;
+    if json {
+        println!("{}", output::line(&output::RevokeReport { revoked }));
+        return Ok(());
+    }
+    println!(
+        "Revoked {} ({}, {}).",
+        shown(&revoked.name),
+        revoked.kind,
+        revoked.id
+    );
+    println!("A running `webmcp connect` ends its sessions within a couple of seconds. Its next session waits for `webmcp approve`.");
+    Ok(())
+}
+
+fn approve_cmd(dir: &Path, args: ApproveArgs, json: bool) -> Result<()> {
+    let cfg = load_config(dir)?;
+    if !cfg.require_approval {
+        return Err(Error::ApprovalsOff.into());
+    }
+    let agents = load_agents(dir)?;
+    let waiting = agents.waiting(&cfg);
+    let named = !args.ids.is_empty();
+    let ids: Vec<String> = if named {
+        args.ids
+    } else if args.all || waiting.is_empty() {
+        waiting.iter().map(|(id, _)| id.to_string()).collect()
+    } else if at_terminal(json) {
+        println!("Waiting for approval on this machine:");
+        for (i, (id, seen)) in waiting.iter().enumerate() {
+            println!(
+                "  {:>2}. {} ({}, {}) wants {}; last seen {}",
+                i + 1,
+                shown(&seen.name),
+                seen.kind,
+                id,
+                seen.servers.join(", "),
+                seen.last_seen
+            );
+        }
+        println!("Approve only an agent you connected yourself.");
+        loop {
+            let answer = prompt("Approve which? (numbers like 1,3; `all`; Enter for none) ");
+            match discover::parse_selection(&answer, waiting.len()) {
+                Ok(picked) => break picked.iter().map(|&i| waiting[i].0.to_string()).collect(),
+                Err(e) => println!("{e}"),
+            }
+        }
+    } else {
+        let list: Vec<String> = waiting
+            .iter()
+            .map(|(id, seen)| format!("{id} ({})", shown(&seen.name)))
+            .collect();
+        bail!(
+            "pass the ids to approve, or --all. Waiting: {}",
+            list.join(", ")
+        );
+    };
+    let added = approvals::approve(dir, &ids, SystemTime::now())?;
+    if json {
+        println!(
+            "{}",
+            output::line(&output::ApproveReport { approved: added })
+        );
+        return Ok(());
+    }
+    if added.is_empty() {
+        println!(
+            "{}",
+            if !named && waiting.is_empty() {
+                "Nothing is waiting for approval."
+            } else {
+                "No agent newly approved."
+            }
+        );
+        return Ok(());
+    }
+    for a in &added {
+        println!("Approved {} ({}, {}).", shown(&a.name), a.kind, a.id);
+    }
+    println!("A running `webmcp connect` picks this up within a couple of seconds; the next session opens.");
+    Ok(())
+}
+
+async fn passkey_cmd(dir: &Path, args: PasskeyArgs, json: bool) -> Result<()> {
+    let cfg = load_config(dir)?;
+    let key = keys::load(dir)?;
+    let ts = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("the system clock is before 1970")?
+        .as_secs();
+    let link = passkey::request_link(&cfg.base_url, &cfg.device_id, &key, ts).await?;
+    if json {
+        println!("{}", output::line(&output::PasskeyLinkReport::new(&link)));
+    } else {
+        println!(
+            "{}",
+            passkey::instructions(&cfg.handle, &cfg.base_url, &link)
+        );
+        println!("\n    {}\n", link.url);
+    }
+    if !args.no_browser {
+        open_in_browser(&link.url);
     }
     Ok(())
 }

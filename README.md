@@ -68,8 +68,8 @@ One command, safe to run again at any point. It does only what is still missing:
     webmcp up --json --attach github --service
 
 `--json` (global; honoured by `up`, `discover`, `status`, `servers`, `attach`, `detach`,
-`service status`) prints exactly one JSON object on stdout, on one line; progress and logs go to
-stderr, and nothing ever prompts. `up` is the one two-line case: if it has to pair it first prints
+`approvals`, `approve`, `passkey`, `service status`) prints exactly one JSON object on stdout, on one line;
+progress and logs go to stderr, and nothing ever prompts. `up` is the one two-line case: if it has to pair it first prints
 
     {"event":"approval_required","verification_uri_complete":"https://webmcp.fast/activate?code=ABCD-EFGH","user_code":"ABCD-EFGH","expires_in":900}
 
@@ -85,7 +85,12 @@ and `message`; `handle`/`device` are null if it failed before pairing. Any other
 `{"event":"error","code":"error","message":"…"}`. Exit codes: `0` ok, `1` error, `2` approval declined,
 `3` approval expired. `webmcp discover --json` gives
 `{"servers":[{"name","alias","kind":"stdio"|"http","command","args","env":[names],"cwd","url","attachable","reason","sources":[{"client","path","project"}]}]}`
-(absent fields omitted); pass an entry's `alias` or `name` to `up --attach`.
+(absent fields omitted); pass an entry's `alias` or `name` to `up --attach`. `webmcp approvals --json`
+(also `approvals on` and `approvals off`) gives
+`{"require_approval":true,"approved":[{"id","kind","name","approved_at"}],"waiting":[{"id","kind","name","servers","last_seen"}]}`;
+`approve --json` gives `{"approved":[…]}` with what it approved, `approvals revoke --json` gives `{"revoked":{…}}`,
+`passkey --json` gives `{"event":"passkey_link","url":"…","expires_in":600}`, and its failures carry the
+gateway's code (`bad_signature`, `clock_skew`, `unknown_device`, `rate_limited`, `invalid_request`).
 
 ## Manual commands
 
@@ -120,8 +125,42 @@ applies. `--mode shared` over stdio is not supported yet. Device names follow th
 it polls `config.toml` and re-advertises the server list. Sessions on a detached alias end with
 `detached`, sessions on an alias whose definition changed end with `reconfigured` (the next session uses
 the new one), everything else keeps running. A config that does not parse is ignored until it does.
-Only `servers` is reloaded; after re-pairing (`webmcp up --force` or `webmcp login --force`), restart
-`webmcp connect`.
+Only `servers` and the approval settings (below) are reloaded; after re-pairing (`webmcp up --force` or
+`webmcp login --force`), restart `webmcp connect`.
+
+## Approving new agents on this machine
+
+    webmcp approvals on             # from now on a new agent needs approval here
+    webmcp approvals                # on or off, what is approved, what is waiting
+    webmcp approve                  # pick from the waiting agents; or: webmcp approve <id>... | --all
+    webmcp approvals revoke <id>    # withdraw one; its live sessions end
+    webmcp approvals off
+
+By default an agent the owner connects on webmcp.fast (OAuth consent or a connector token) can use
+this machine at once. With approvals on, a new agent credential opens no session here until someone
+at this machine runs `webmcp approve`. Its first attempt is refused (`approval_required`), recorded in
+`agents.json` next to the config (ids and names, never tokens), and announced by a desktop
+notification on macOS, and on Linux when `notify-send` is installed, at most once per agent every 10
+minutes (`WEBMCP_NO_NOTIFY=1` turns notifications off). Approve only an agent you just connected
+yourself: its name comes from whoever connected it. `approvals on` offers to keep the agents that
+already connected, so nothing that works today breaks, and `approvals off` clears the approved list.
+A running `webmcp connect` picks up every change within seconds; a revoked agent's sessions end.
+
+The trade-off. On: a stolen webmcp.fast account, or a gateway bug that mints credentials, cannot add
+an agent to this machine. Cost: each new agent needs `webmcp approve` here once, and approvals can
+only be turned off here. The setting lives in `config.toml`, the gateway has no way to change it, and
+pairing again keeps it. It does not protect against a compromised gateway, which could reuse an
+approved agent's credential id (`THREAT_MODEL.md`).
+
+## Adding a passkey from your machine
+
+    webmcp passkey [--no-browser]
+
+Once your account has a paired device, webmcp.fast accepts a first passkey, or one added without an
+existing passkey to recover the account, only through a link started from that device. So someone who
+knows your email cannot enroll their own passkey first. `webmcp passkey` signs the request with this
+machine's device key, prints the link and tries to open it: open it in the browser where you are
+signed in to `<handle>.webmcp.fast`, within 10 minutes, and add the passkey. The link works once.
 
 ## Running in the background (macOS, Linux)
 
