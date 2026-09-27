@@ -132,7 +132,7 @@ more than 300 s away from its own clock, either way.
 | 201 | `{"url":"https://…","expires_in":600}` | Open `url` in a browser within `expires_in` seconds. |
 | 400 | `{"error":"invalid_request","message":"…"}` | Malformed body. |
 | 401 | `{"error":"bad_signature"}` | The signature does not verify against the device's public key. |
-| 401 | `{"error":"clock_skew"}` | `ts` is more than 300 s off. |
+| 400 | `{"error":"clock_skew"}` | `ts` is more than 300 s off. |
 | 404 | `{"error":"unknown_device"}` | Unknown or revoked device. |
 | 429 | `{"error":"rate_limited"}` | Too many links asked for. |
 
