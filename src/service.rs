@@ -271,17 +271,67 @@ fn install_launchd(spec: &ServiceSpec) -> Result<PathBuf, Error> {
     create_parents(&path, &spec.log_file)?;
     std::fs::write(&path, plist(spec)).map_err(|e| Error::io("write launch agent", &path, e))?;
     let target = format!("{}/{LABEL}", domain());
-    // Replace a previous definition; "not loaded" is the normal first-run answer.
-    let _ = launchctl(&["bootout", &target]);
-    let out = launchctl(&["bootstrap", &domain(), &path.display().to_string()])
-        .map_err(|e| Error::io("run launchctl", Path::new("/bin/launchctl"), e))?;
-    if !out.status.success() {
-        return Err(Error::Invalid {
-            field: "launchctl bootstrap",
-            reason: String::from_utf8_lossy(&out.stderr).trim().to_string(),
-        });
-    }
+    let mut run = |args: &[&str]| {
+        launchctl(args).map(|out| Answer {
+            ok: out.status.success(),
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        })
+    };
+    reload_launchd(
+        &mut run,
+        &mut std::thread::sleep,
+        &target,
+        &domain(),
+        &path.display().to_string(),
+    )?;
     Ok(path)
+}
+
+/// What a `launchctl` run said, as far as reloading cares.
+struct Answer {
+    ok: bool,
+    stderr: String,
+}
+
+/// Replace any loaded copy of the job with the definition at `plist`.
+/// `bootout` returns while launchd is still tearing the old job down, and a
+/// `bootstrap` in that window fails with "5: Input/output error", leaving no
+/// service at all. So wait for the old job to go, and retry that one answer.
+fn reload_launchd(
+    run: &mut dyn FnMut(&[&str]) -> std::io::Result<Answer>,
+    sleep: &mut dyn FnMut(std::time::Duration),
+    target: &str,
+    domain: &str,
+    plist: &str,
+) -> Result<(), Error> {
+    use std::time::Duration;
+    let io = |e| Error::io("run launchctl", Path::new("/bin/launchctl"), e);
+    // "Not loaded" is the normal first-run answer.
+    let _ = run(&["bootout", target]);
+    // The daemon disconnects cleanly on SIGTERM, which takes about 2 s; launchd
+    // kills a job that is still going after 20 s (ExitTimeOut). Wait out both.
+    for _ in 0..250 {
+        match run(&["print", target]) {
+            Ok(a) if a.ok => sleep(Duration::from_millis(100)),
+            _ => break,
+        }
+    }
+    let mut reason = String::new();
+    for attempt in 1..=5u64 {
+        let a = run(&["bootstrap", domain, plist]).map_err(io)?;
+        if a.ok {
+            return Ok(());
+        }
+        reason = a.stderr;
+        if !reason.contains("Input/output error") {
+            break;
+        }
+        sleep(Duration::from_millis(300 * attempt));
+    }
+    Err(Error::Invalid {
+        field: "launchctl bootstrap",
+        reason,
+    })
 }
 
 fn install_systemd(spec: &ServiceSpec) -> Result<PathBuf, Error> {
@@ -369,6 +419,92 @@ pub fn node_version_manager(program: &Path) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type Calls = std::rc::Rc<std::cell::RefCell<Vec<String>>>;
+
+    /// Plays launchctl back from a script: each subcommand answers in turn.
+    fn scripted(
+        mut answers: Vec<(&'static str, bool, &'static str)>,
+    ) -> (impl FnMut(&[&str]) -> std::io::Result<Answer>, Calls) {
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = calls.clone();
+        let run = move |args: &[&str]| {
+            seen.borrow_mut().push(args[0].to_string());
+            let at = answers
+                .iter()
+                .position(|(cmd, _, _)| *cmd == args[0])
+                .unwrap_or_else(|| panic!("unscripted launchctl {}", args[0]));
+            let (_, ok, stderr) = answers.remove(at);
+            Ok(Answer {
+                ok,
+                stderr: stderr.to_string(),
+            })
+        };
+        (run, calls)
+    }
+
+    const EIO: &str = "Bootstrap failed: 5: Input/output error";
+
+    #[test]
+    fn reinstall_waits_for_the_old_job_to_unload_before_loading() {
+        let (mut run, calls) = scripted(vec![
+            ("bootout", true, ""),
+            ("print", true, "state = running"),
+            ("print", true, "state = exiting"),
+            ("print", false, "Could not find service"),
+            ("bootstrap", true, ""),
+        ]);
+        reload_launchd(&mut run, &mut |_| {}, "gui/501/x", "gui/501", "/p.plist").unwrap();
+        assert_eq!(
+            *calls.borrow(),
+            ["bootout", "print", "print", "print", "bootstrap"]
+        );
+    }
+
+    #[test]
+    fn reinstall_retries_the_transient_input_output_error() {
+        let (mut run, calls) = scripted(vec![
+            ("bootout", true, ""),
+            ("print", false, ""),
+            ("bootstrap", false, EIO),
+            ("bootstrap", false, EIO),
+            ("bootstrap", true, ""),
+        ]);
+        reload_launchd(&mut run, &mut |_| {}, "gui/501/x", "gui/501", "/p.plist").unwrap();
+        assert_eq!(
+            calls.borrow().iter().filter(|c| *c == "bootstrap").count(),
+            3
+        );
+    }
+
+    #[test]
+    fn reinstall_reports_other_failures_at_once_and_gives_up_on_endless_ones() {
+        let (mut run, calls) = scripted(vec![
+            ("bootout", false, "No such process"),
+            ("print", false, ""),
+            ("bootstrap", false, "Bootstrap failed: 17: File exists"),
+        ]);
+        let err = reload_launchd(&mut run, &mut |_| {}, "gui/501/x", "gui/501", "/p.plist")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("17: File exists"), "{err}");
+        assert_eq!(
+            calls.borrow().iter().filter(|c| *c == "bootstrap").count(),
+            1
+        );
+
+        let mut script = vec![("bootout", true, ""), ("print", false, "")];
+        script.extend(std::iter::repeat_n(("bootstrap", false, EIO), 5));
+        let (mut run, calls) = scripted(script);
+        let err = reload_launchd(&mut run, &mut |_| {}, "gui/501/x", "gui/501", "/p.plist")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("5: Input/output error"), "{err}");
+        assert_eq!(
+            calls.borrow().iter().filter(|c| *c == "bootstrap").count(),
+            5
+        );
+    }
 
     #[test]
     fn spots_node_version_manager_paths() {
