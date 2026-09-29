@@ -1,0 +1,6 @@
+# One compiler for CI, releases and local builds, so a release is built with
+# a known toolchain. Bump deliberately.
+[toolchain]
+channel = "1.96.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
