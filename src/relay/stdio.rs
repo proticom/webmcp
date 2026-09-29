@@ -1,6 +1,7 @@
 //! stdio backend: one child process per session, newline-delimited JSON on
 //! its stdin/stdout (MCP stdio framing), stderr to the log.
 
+use std::ffi::OsString;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -19,6 +20,78 @@ const EXIT_DRAIN: Duration = Duration::from_millis(500);
 /// stderr lines longer than this end stderr logging for the session.
 const MAX_STDERR_LINE: usize = 64 * 1024;
 
+/// Variables a child inherits from the daemon. Everything else (cloud keys,
+/// tokens in the user's shell) stays out unless the entry names it in `env`,
+/// because an agent can often make a server echo its environment.
+const INHERITED_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "TZ",
+    "TERM",
+    "TMPDIR",
+    "XDG_RUNTIME_DIR",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DATA_HOME",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "NODE_EXTRA_CA_CERTS",
+    // Windows: what processes need to start and find their profile.
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "USERNAME",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+];
+
+fn inherited(name: &str) -> bool {
+    let matches = |n: &&str| {
+        if cfg!(windows) {
+            n.eq_ignore_ascii_case(name)
+        } else {
+            *n == name
+        }
+    };
+    INHERITED_ENV.iter().any(matches) || name.starts_with("LC_")
+}
+
+/// The child's whole environment: the allowlisted part of `parent`, then the
+/// entry's own `env` on top.
+fn child_env(
+    parent: impl IntoIterator<Item = (OsString, OsString)>,
+    entry: &ServerEntry,
+) -> Vec<(OsString, OsString)> {
+    let mut out: Vec<(OsString, OsString)> = parent
+        .into_iter()
+        .filter(|(k, _)| k.to_str().is_some_and(inherited))
+        .collect();
+    out.extend(entry.env.iter().map(|(k, v)| (k.into(), v.into())));
+    out
+}
+
 #[derive(Debug, thiserror::Error)]
 enum SpawnError {
     #[error("{0}")]
@@ -35,7 +108,8 @@ fn spawn(entry: &ServerEntry) -> Result<Child, SpawnError> {
     let argv = entry.argv()?;
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..])
-        .envs(&entry.env)
+        .env_clear()
+        .envs(child_env(std::env::vars_os(), entry))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -221,6 +295,45 @@ pub(super) async fn read_line_bounded<R: AsyncBufRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_env_keeps_the_allowlist_and_the_entry_env_only() {
+        let mut entry = ServerEntry::stdio(
+            "s",
+            "npx -y @scope/server",
+            crate::proto::SessionMode::default(),
+        )
+        .unwrap();
+        entry
+            .env
+            .insert("GITHUB_TOKEN".into(), "from-config".into());
+        entry.env.insert("PATH".into(), "/custom".into());
+        let parent = [
+            ("PATH", "/usr/bin"),
+            ("HOME", "/Users/a"),
+            ("LC_ALL", "C"),
+            ("AWS_SECRET_ACCESS_KEY", "leak"),
+            ("GITHUB_TOKEN", "from-shell"),
+            ("OPENAI_API_KEY", "leak"),
+        ]
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let got = child_env(parent, &entry);
+        let pairs: Vec<(&str, &str)> = got
+            .iter()
+            .map(|(k, v)| (k.to_str().unwrap(), v.to_str().unwrap()))
+            .collect();
+        // Later entries win when Command applies them, so the config's PATH overrides.
+        assert_eq!(
+            pairs,
+            [
+                ("PATH", "/usr/bin"),
+                ("HOME", "/Users/a"),
+                ("LC_ALL", "C"),
+                ("GITHUB_TOKEN", "from-config"),
+                ("PATH", "/custom"),
+            ]
+        );
+    }
 
     #[tokio::test]
     async fn bounded_lines() {

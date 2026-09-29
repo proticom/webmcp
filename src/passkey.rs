@@ -120,6 +120,21 @@ pub fn link_url(base_url: &str) -> String {
 
 /// Ask the gateway at `base_url` for a passkey link, signed with the device
 /// key as of `ts` (Unix seconds).
+/// `link` is on `base_url`'s scheme and host.
+fn same_site(base_url: &str, link: &str) -> bool {
+    match (url::Url::parse(base_url), url::Url::parse(link)) {
+        (Ok(b), Ok(l)) => {
+            matches!(l.scheme(), "https" | "http")
+                && l.scheme() == b.scheme()
+                && l.host_str().is_some()
+                && l.host_str().map(str::to_ascii_lowercase)
+                    == b.host_str().map(str::to_ascii_lowercase)
+                && l.port_or_known_default() == b.port_or_known_default()
+        }
+        _ => false,
+    }
+}
+
 pub async fn request_link(
     base_url: &str,
     device_id: &str,
@@ -156,11 +171,15 @@ pub async fn request_link(
     if (200..300).contains(&status) {
         let link: PasskeyLink = serde_json::from_str(&body)
             .map_err(|e| unexpected(format!("could not parse body ({e}): {body}")))?;
-        // It is printed and handed to the browser opener: never a file or
-        // app-specific scheme.
-        return match url::Url::parse(&link.url) {
-            Ok(u) if matches!(u.scheme(), "https" | "http") => Ok(link),
-            _ => Err(unexpected(format!("not a web link: {}", link.url))),
+        // It is printed and handed to the browser opener: only a page on the
+        // site this machine is paired with, never a file or app scheme.
+        return if same_site(base_url, &link.url) {
+            Ok(link)
+        } else {
+            Err(unexpected(format!(
+                "not a link to {base_url}: {}",
+                link.url
+            )))
         };
     }
     match serde_json::from_str::<ErrorBody>(&body) {
@@ -199,6 +218,31 @@ pub fn instructions(handle: &str, base_url: &str, link: &PasskeyLink) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn links_must_point_at_the_paired_site() {
+        assert!(same_site(
+            "https://webmcp.fast",
+            "https://webmcp.fast/app/security?link=x"
+        ));
+        assert!(same_site(
+            "http://localhost:8788",
+            "http://localhost:8788/app/security"
+        ));
+        assert!(!same_site(
+            "https://webmcp.fast",
+            "https://evil.example/app/security"
+        ));
+        assert!(!same_site(
+            "https://webmcp.fast",
+            "http://webmcp.fast/app/security"
+        ));
+        assert!(!same_site(
+            "https://webmcp.fast",
+            "https://webmcp.fast.evil.example/"
+        ));
+        assert!(!same_site("https://webmcp.fast", "file:///etc/passwd"));
+    }
 
     #[test]
     fn signed_string_layout() {

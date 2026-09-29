@@ -349,7 +349,15 @@ async fn login(dir: PathBuf, args: LoginArgs) -> Result<()> {
         Err(e) => return Err(e.into()),
     };
 
-    let cfg = pair::persist(&dir, &key, resp, device_name, hardware_id, existing)?;
+    let cfg = pair::persist(
+        &dir,
+        &key,
+        &args.base_url,
+        resp,
+        device_name,
+        hardware_id,
+        existing,
+    )?;
 
     println!(
         "Paired as {}/{} (device id {}).",
@@ -652,7 +660,15 @@ async fn up_pair(
     }
 
     let resp = device_auth::wait(base_url, &started, &device_name, PollTiming::default()).await?;
-    let cfg = pair::persist(dir, &key, resp, device_name, hardware_id, existing)?;
+    let cfg = pair::persist(
+        dir,
+        &key,
+        base_url,
+        resp,
+        device_name,
+        hardware_id,
+        existing,
+    )?;
     say(
         json,
         format!(

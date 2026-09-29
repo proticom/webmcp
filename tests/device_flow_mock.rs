@@ -214,6 +214,7 @@ async fn pending_then_slow_down_then_approved_persists_config_and_key() {
     let cfg = pair::persist(
         dir.path(),
         &key,
+        "https://webmcp.fast",
         resp,
         "studio".into(),
         "ab".repeat(32),
@@ -250,7 +251,16 @@ async fn a_device_name_chosen_on_the_approval_page_wins() {
         .await
         .unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let cfg = pair::persist(dir.path(), &key, resp, "studio".into(), "00".into(), None).unwrap();
+    let cfg = pair::persist(
+        dir.path(),
+        &key,
+        "https://webmcp.fast",
+        resp,
+        "studio".into(),
+        "00".into(),
+        None,
+    )
+    .unwrap();
     assert_eq!(cfg.device_name, "renamed");
 }
 

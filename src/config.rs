@@ -97,8 +97,8 @@ pub struct ServerEntry {
     pub url: Option<String>,
     #[serde(default)]
     pub mode: SessionMode,
-    /// Extra environment for the spawned `stdio` process (added to the
-    /// daemon's own environment).
+    /// Environment for the spawned `stdio` process, on top of a short
+    /// allowlist from the daemon's own (PATH, HOME, locale, proxy, temp dirs).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
     /// Working directory of the spawned `stdio` process.

@@ -104,6 +104,11 @@ gateway's code (`bad_signature`, `clock_skew`, `unknown_device`, `rate_limited`,
     webmcp attach web --http http://localhost:3000/mcp --mode shared
     webmcp servers / webmcp detach <alias>
 
+A stdio server starts with a clean environment: `PATH`, `HOME`, the user and shell names, locale, temp
+directories, proxy and CA-bundle variables, plus whatever its `--env` sets. Keys in your shell such as
+`AWS_*` or `GITHUB_TOKEN` are not passed on, because an agent can often make a server print its
+environment. Name a variable with `--env` to give it to one server.
+
 Only one `webmcp connect` runs per device: it holds a lock (`daemon.lock` in the config directory) and a
 second one exits naming the first one's pid. If another machine connects with a copy of this identity,
 the gateway closes this connection with `1012 "replaced"` and the daemon stops instead of fighting for

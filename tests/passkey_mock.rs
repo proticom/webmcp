@@ -33,6 +33,7 @@ struct Seen {
 async fn gateway(status: u16, body: Value) -> (String, Arc<Mutex<Vec<Seen>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let base = base_url.clone();
     let seen = Arc::new(Mutex::new(Vec::new()));
     let log = seen.clone();
     tokio::spawn(async move {
@@ -45,6 +46,8 @@ async fn gateway(status: u16, body: Value) -> (String, Arc<Mutex<Vec<Seen>>>) {
                 Value::String(s) => (s.clone(), "text/plain"),
                 other => (other.to_string(), "application/json"),
             };
+            // Links the real gateway returns are on its own origin.
+            let text = text.replace("{base}", &base);
             let head = format!(
                 "HTTP/1.1 {status} X\r\ncontent-type: {kind}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                 text.len()
@@ -98,8 +101,13 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<Seen> {
 #[tokio::test]
 async fn a_signed_request_gets_a_link() {
     let key = keys::generate();
-    let url = "https://alice.webmcp.fast/app/passkey?link=pkl_0123456789abcdef";
-    let (base, seen) = gateway(201, json!({ "url": url, "expires_in": 600 })).await;
+    let (base, seen) = gateway(
+        201,
+        json!({ "url": "{base}/app/security?link=pkl_0123456789abcdef", "expires_in": 600 }),
+    )
+    .await;
+    let url = format!("{base}/app/security?link=pkl_0123456789abcdef");
+    let url = url.as_str();
     let link = passkey::request_link(&base, DEVICE_ID, &key, TS)
         .await
         .unwrap();
