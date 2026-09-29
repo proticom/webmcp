@@ -107,32 +107,25 @@ human chose a different device name on the approval page, the `200` body's
 
 Once an account has a paired device, its first passkey, and any passkey added
 without an existing one (recovery), must be started from that device. The
-daemon proves it holds the device key (`webmcp passkey`):
+daemon proves it holds the device key (`webmcp passkey`) with a signed request
+(§1c):
 
 ```
 POST https://webmcp.fast/api/v1/device/passkey-link
 Content-Type: application/json
+Content-Digest: sha-256=:…:
+Signature-Input: webmcp=("@method" "@authority" "@path" "@query" "content-digest");created=…;nonce="…";alg="ed25519";keyid="dev_…";tag="webmcp-device"
+Signature: webmcp=:…:
 User-Agent: webmcp-daemon/<version> (<platform>)
 
-{ "device_id": "dev_…", "ts": 1790000000, "signature": "<base64, 64 bytes>" }
+{}
 ```
-
-`ts` is the daemon's clock in Unix seconds, a JSON number. The signature is
-Ed25519, made with the device key, over the UTF-8 bytes of:
-
-```
-"webmcp-passkey-link-v1\n" + device_id + "\n" + ts
-```
-
-where `ts` is written in decimal exactly as sent. The gateway rejects a `ts`
-more than 300 s away from its own clock, either way.
 
 | Status | Body | Meaning |
 |---|---|---|
 | 201 | `{"url":"https://…","expires_in":600}` | Open `url` in a browser within `expires_in` seconds. |
-| 400 | `{"error":"invalid_request","message":"…"}` | Malformed body. |
-| 401 | `{"error":"bad_signature"}` | The signature does not verify against the device's public key. |
-| 400 | `{"error":"clock_skew"}` | `ts` is more than 300 s off. |
+| 400 | `{"error":"bad_digest"}` / `{"error":"bad_nonce"}` | The body does not match `Content-Digest`, or the nonce is missing or too short. |
+| 401 | `{"error":"bad_signature"}` / `{"error":"replayed"}` | The signature does not verify, is outside the time window, or its nonce was already used. |
 | 404 | `{"error":"unknown_device"}` | Unknown or revoked device. |
 | 429 | `{"error":"rate_limited"}` | Too many links asked for. |
 
@@ -142,37 +135,52 @@ whatever the status, and treats a `429` without a JSON body as
 
 The link works once, for 10 minutes, and only for a signed-in user who can
 manage that device's handle. It lets that browser add a passkey without an
-existing one.
+existing one. The daemon only opens a link on the site it is paired with.
+
+## 1c. Signed device requests
+
+A device proves it holds its key with HTTP Message Signatures (RFC 9421),
+Ed25519, and for requests with a body a `Content-Digest` (RFC 9530,
+`sha-256`). The signature is labelled `webmcp` and:
+
+- covers `"@method" "@authority" "@path" "@query"`, plus `"content-digest"`
+  when there is a body;
+- carries `created` (Unix seconds), `keyid` (the device id), `alg="ed25519"`,
+  a random `nonce` of 16 to 128 characters, and `tag="webmcp-device"`.
+
+The gateway accepts a signature created within 300 s of its own clock, either
+way, and each nonce once per device. For a WebSocket upgrade the signed
+authority, path and query are those of the `wss` URL, which the gateway sees
+as the same `https` request.
+
+Daemons up to 0.2.1 used two older, non-standard signatures instead (a
+signed `ts` in the passkey-link body, and an in-band `challenge`/`auth` on
+the relay socket). The gateway still accepts them while those daemons are in
+use; they will be removed.
 
 ## 2. Relay connection
 
 ```
 GET wss://webmcp.fast/connect?device_id=dev_…
+Signature-Input: webmcp=("@method" "@authority" "@path" "@query");created=…;nonce="…";alg="ed25519";keyid="dev_…";tag="webmcp-device"
+Signature: webmcp=:…:
 User-Agent: webmcp-daemon/<version> (<platform>)
 ```
 
-The gateway rejects the upgrade with HTTP `404` if the device is unknown or
-revoked. The daemon treats that as final: it stops and tells the user to pair
-again (`webmcp up --force`) instead of reconnecting. After upgrade, the
-handshake is:
+The upgrade is signed (§1c), so the gateway checks the device before any
+socket exists. It answers `401` to a signature that does not verify, and
+`404` if the device is unknown or revoked. The daemon treats `404` as final:
+it stops and tells the user to pair again (`webmcp up --force`) instead of
+reconnecting. After the upgrade:
 
 ```
-daemon → {"t":"hello","v":1,"device_id":"dev_…","daemon_version":"0.1.0","platform":"macos-aarch64"}
-gateway → {"t":"challenge","nonce":"<base64, 32 bytes>"}
-daemon → {"t":"auth","signature":"<base64, 64 bytes>"}
+daemon → {"t":"hello","v":1,"device_id":"dev_…","daemon_version":"0.3.0","platform":"macos-aarch64"}
 gateway → {"t":"welcome","handle":"alice","device":"macbook","server_time":"2026-09-19T21:00:00Z"}
 ```
 
-The signature is Ed25519 over the UTF-8 bytes of:
-
-```
-"webmcp-connect-v1\n" + device_id + "\n" + nonce
-```
-
-where `nonce` is the base64 string exactly as received. On failure the
-gateway sends `{"t":"error","code":"unauthorized"}` and closes with code
-`4401`. Any frame before `welcome` other than `hello`/`auth` closes with
-`4400`. A `hello` with `v` other than 1 closes with `4406`.
+A `hello` whose `device_id` differs from the signed `keyid` closes with
+`4401`. Any other frame before `welcome` closes with `4400`. A `hello` with
+`v` other than 1 closes with `4406`.
 
 ### Keep-alive
 
@@ -266,6 +274,22 @@ preference is on. A policy, once set, survives detach and re-attach. The plan
 limit counts enabled servers that are currently advertised, per device.
 `{"t":"error","code":"server_limit"}` after a `servers` frame names the
 aliases held back by that limit.
+
+### Tool permissions on the device
+
+Each attached server can carry a tool rule and a confirmation setting in the
+device's config (`webmcp tools`, `webmcp confirm`). No frame reads or changes
+them. The daemon applies them to every session, whatever the gateway sends:
+
+- `tools/list` answers lose the tools the rule does not allow.
+- A `tools/call` for such a tool is answered by the daemon with a JSON-RPC
+  error (`-32001`) and never reaches the server.
+- With confirmation on, a `tools/call` waits for the owner's Allow on the
+  device; Deny or no answer within 60 s gets the same error.
+- A batch (a JSON array) gets `-32600`. A request with no id that is not a
+  `notifications/*` message is dropped.
+
+The gateway's own per-tool policy can narrow this further, never widen it.
 
 ### Local approval of new agents
 
