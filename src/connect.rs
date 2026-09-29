@@ -19,6 +19,7 @@ use tracing::{debug, info, warn};
 
 use crate::approvals::{Admission, Recorder};
 use crate::config::ServerEntry;
+use crate::confirm::Confirmer;
 use crate::keys;
 use crate::platform;
 use crate::proto::{
@@ -68,6 +69,8 @@ pub struct ConnectOptions {
     /// Desktop notification when an agent waits for approval. Off unless the
     /// CLI turns it on, so a library user or a test never pops one.
     pub notify: bool,
+    /// Answers tool-call confirmations; `None` is the desktop dialog.
+    pub confirmer: Option<Confirmer>,
     /// How often `config_path` is checked for changes.
     pub config_poll_interval: Duration,
     /// Session limits and timeouts for the relay.
@@ -97,6 +100,7 @@ impl ConnectOptions {
             admission: Admission::Open,
             config_path: None,
             notify: false,
+            confirmer: None,
             config_poll_interval: DEFAULT_POLL_INTERVAL,
             relay: RelayOptions::default(),
             once: false,
@@ -304,6 +308,9 @@ async fn connection(
         opts.relay.clone(),
         out.clone(),
     );
+    if let Some(confirmer) = &opts.confirmer {
+        relay = relay.with_confirmer(confirmer.clone());
+    }
 
     let result = async {
         if !advertise(&out, watcher).await? {

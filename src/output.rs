@@ -9,6 +9,7 @@
 //!
 //! Exit codes: 0 ok, 1 error, 2 approval declined, 3 approval expired.
 
+use crate::policy::{Confirm, ToolPolicy};
 use serde::Serialize;
 
 use crate::approvals::Agents;
@@ -235,6 +236,8 @@ pub struct ServerView {
     pub mode: SessionMode,
     pub target: String,
     pub url: Option<String>,
+    pub tools: ToolPolicy,
+    pub confirm: Confirm,
 }
 
 impl ServerView {
@@ -245,6 +248,8 @@ impl ServerView {
             mode: s.mode,
             target: s.target().to_string(),
             url: public_url(&cfg.base_url, &cfg.handle, &cfg.device_name, &s.alias),
+            tools: s.tools.clone(),
+            confirm: s.confirm,
         }
     }
 }
@@ -253,6 +258,12 @@ impl ServerView {
 #[derive(Debug, Serialize)]
 pub struct ServersReport {
     pub servers: Vec<ServerView>,
+}
+
+/// `tools --json` and `confirm --json`: the server after the change.
+#[derive(Debug, Serialize)]
+pub struct PolicyReport {
+    pub server: ServerView,
 }
 
 /// `attach --json`.
@@ -487,7 +498,8 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&l).unwrap()["servers"][0],
             json!({"alias": "github", "transport": "stdio", "mode": "per-session",
-                   "target": "npx -y gh", "url": "https://alice.webmcp.fast/studio/github/mcp"})
+                   "target": "npx -y gh", "url": "https://alice.webmcp.fast/studio/github/mcp",
+                   "tools": "all", "confirm": "never"})
         );
     }
 

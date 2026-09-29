@@ -296,7 +296,7 @@ fn shown(c: char) -> bool {
 
 /// A name from the gateway as it is stored and shown: control and format
 /// characters dropped, trimmed, at most `MAX_NAME_CHARS`.
-fn clean_name(raw: &str) -> String {
+pub(crate) fn clean_name(raw: &str) -> String {
     let kept: String = raw.chars().filter(|&c| shown(c)).collect();
     let cut: String = kept.trim().chars().take(MAX_NAME_CHARS).collect();
     cut.trim_end().to_string()

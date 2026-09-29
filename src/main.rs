@@ -17,6 +17,7 @@ use webmcp_daemon::lock::{InstanceLock, LockError};
 use webmcp_daemon::output::{self, ServiceOutcome, UpEvent, UpReport};
 use webmcp_daemon::pair::{self, PairError, PairRequest};
 use webmcp_daemon::passkey::{self, PasskeyError};
+use webmcp_daemon::policy::{Confirm, ToolPolicy};
 use webmcp_daemon::proto::SessionMode;
 use webmcp_daemon::{approvals, keys, platform, service, Error};
 
@@ -61,6 +62,11 @@ enum Command {
     Detach { alias: String },
     /// List attached servers
     Servers,
+    /// Which tools agents may see and call on a server, enforced on this
+    /// machine whatever the dashboard says
+    Tools(ToolsArgs),
+    /// Whether a tool call waits for you to click Allow on this machine
+    Confirm(ConfirmArgs),
     /// Show whether a new agent needs approval on this machine, or change it
     Approvals {
         #[command(subcommand)]
@@ -89,6 +95,47 @@ enum ApprovalsAction {
         /// Credential id, as `webmcp approvals` lists it
         id: String,
     },
+}
+
+#[derive(Args)]
+#[command(after_help = "Examples:\n  \
+    webmcp tools fs                         # show the current rule\n  \
+    webmcp tools fs read-only               # only tools the server marks read-only\n  \
+    webmcp tools fs allow read_file list_dir\n  \
+    webmcp tools fs all")]
+struct ToolsArgs {
+    alias: String,
+    /// all, read-only, or allow followed by tool names
+    rule: Option<ToolRule>,
+    /// Tool names, with `allow`
+    names: Vec<String>,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ToolRule {
+    All,
+    ReadOnly,
+    Allow,
+}
+
+#[derive(Args)]
+#[command(after_help = "never: calls run without asking (the default).\n\
+destructive: a tool not marked read-only, or not marked harmless, pops an Allow/Deny\n  \
+dialog on this machine first. Unanswered in 60 seconds counts as Deny.\n\
+always: every call asks.\n\n\
+Cost: someone has to be at this machine. With no desktop session (a server, an SSH\n\
+login) there is no dialog, so asking means Deny.")]
+struct ConfirmArgs {
+    alias: String,
+    /// never, destructive or always; omit to show the current setting
+    when: Option<ConfirmWhen>,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ConfirmWhen {
+    Never,
+    Destructive,
+    Always,
 }
 
 #[derive(Args)]
@@ -261,6 +308,8 @@ fn run(cli: Cli) -> Result<i32> {
         Command::Attach(args) => attach(dir, args, json)?,
         Command::Detach { alias } => detach(dir, &alias, json)?,
         Command::Servers => servers(dir, json)?,
+        Command::Tools(args) => tools_cmd(&dir, args, json)?,
+        Command::Confirm(args) => confirm_cmd(&dir, args, json)?,
         Command::Approvals { action } => approvals_cmd(&dir, action, json)?,
         Command::Approve(args) => approve_cmd(&dir, args, json)?,
         Command::Passkey(args) => runtime()?.block_on(passkey_cmd(&dir, args, json))?,
@@ -1092,6 +1141,105 @@ fn servers(dir: PathBuf, json: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn describe_tools(p: &ToolPolicy) -> String {
+    match p {
+        ToolPolicy::All => "every tool the server offers".into(),
+        ToolPolicy::ReadOnly => "only tools the server marks read-only".into(),
+        ToolPolicy::Allow(names) if names.is_empty() => "no tools".into(),
+        ToolPolicy::Allow(names) => {
+            format!(
+                "only {}",
+                names.iter().cloned().collect::<Vec<_>>().join(", ")
+            )
+        }
+    }
+}
+
+fn describe_confirm(c: Confirm) -> &'static str {
+    match c {
+        Confirm::Never => "calls run without asking",
+        Confirm::Destructive => "tools that can change things ask for Allow on this machine",
+        Confirm::Always => "every call asks for Allow on this machine",
+    }
+}
+
+/// Save a changed server and report it. A running `connect` sees the new
+/// entry within seconds and ends that server's sessions, so agents come back
+/// under the new rule.
+fn report_policy(dir: &Path, cfg: &Config, alias: &str, changed: bool, json: bool) -> Result<()> {
+    if changed {
+        cfg.save_to(dir)?;
+    }
+    let entry = cfg
+        .servers
+        .iter()
+        .find(|s| s.alias == alias)
+        .expect("alias was just looked up");
+    if json {
+        let server = output::ServerView::new(cfg, entry);
+        println!("{}", output::line(&output::PolicyReport { server }));
+        return Ok(());
+    }
+    println!(
+        "{alias}: {}; {}.",
+        describe_tools(&entry.tools),
+        describe_confirm(entry.confirm)
+    );
+    if changed {
+        println!("A running `webmcp connect` applies this within a couple of seconds.");
+    }
+    Ok(())
+}
+
+fn tools_cmd(dir: &Path, args: ToolsArgs, json: bool) -> Result<()> {
+    let mut cfg = load_config(dir)?;
+    let entry = cfg.server_mut(&args.alias)?;
+    let next = match (args.rule, args.names.is_empty()) {
+        (None, true) => None,
+        (Some(ToolRule::All), true) => Some(ToolPolicy::All),
+        (Some(ToolRule::ReadOnly), true) => Some(ToolPolicy::ReadOnly),
+        (Some(ToolRule::Allow), false) => {
+            for name in &args.names {
+                if name.is_empty() || name.len() > 128 {
+                    bail!("tool names are 1 to 128 characters: `{name}`");
+                }
+            }
+            Some(ToolPolicy::Allow(args.names.iter().cloned().collect()))
+        }
+        (Some(ToolRule::Allow), true) => bail!(
+            "name the tools to allow: webmcp tools {} allow <name>...",
+            args.alias
+        ),
+        _ => bail!("tool names go after `allow`"),
+    };
+    let changed = match next {
+        Some(p) if p != entry.tools => {
+            entry.tools = p;
+            true
+        }
+        _ => false,
+    };
+    report_policy(dir, &cfg, &args.alias, changed, json)
+}
+
+fn confirm_cmd(dir: &Path, args: ConfirmArgs, json: bool) -> Result<()> {
+    let mut cfg = load_config(dir)?;
+    let entry = cfg.server_mut(&args.alias)?;
+    let next = args.when.map(|w| match w {
+        ConfirmWhen::Never => Confirm::Never,
+        ConfirmWhen::Destructive => Confirm::Destructive,
+        ConfirmWhen::Always => Confirm::Always,
+    });
+    let changed = match next {
+        Some(c) if c != entry.confirm => {
+            entry.confirm = c;
+            true
+        }
+        _ => false,
+    };
+    report_policy(dir, &cfg, &args.alias, changed, json)
 }
 
 /// Printed by `approvals on`: what it buys, and what it costs.
