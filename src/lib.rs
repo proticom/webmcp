@@ -22,5 +22,6 @@ pub mod proto;
 pub mod relay;
 pub mod reload;
 pub mod service;
+pub mod signing;
 
 pub use error::Error;

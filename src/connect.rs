@@ -28,6 +28,7 @@ use crate::proto::{
 };
 use crate::relay::{Relay, RelayOptions, MAX_GATEWAY_FRAME_BYTES};
 use crate::reload::{ConfigWatcher, Pairing, DEFAULT_POLL_INTERVAL};
+use crate::signing;
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -273,6 +274,24 @@ async fn connection(
         tungstenite::http::header::USER_AGENT,
         platform::user_agent().parse().expect("static user agent"),
     );
+    // The upgrade itself proves the device (RFC 9421), so the gateway can
+    // refuse a stranger before any socket exists.
+    let signed = signing::sign(
+        &opts.signing_key,
+        &opts.device_id,
+        "GET",
+        &url,
+        None,
+        signing::now(),
+        &signing::nonce(),
+    )
+    .map_err(|e| ConnectError::Handshake(e.to_string()))?;
+    for (name, value) in signed.pairs() {
+        let value = value
+            .parse()
+            .map_err(|_| ConnectError::Handshake(format!("unencodable {name} header")))?;
+        request.headers_mut().insert(name, value);
+    }
     debug!(%url, "dialling relay");
     let ws_config = WebSocketConfig::default().max_message_size(Some(MAX_WS_MESSAGE_BYTES));
     let dialled =
@@ -281,6 +300,9 @@ async fn connection(
         Ok(ok) => ok,
         Err(tungstenite::Error::Http(resp)) if resp.status() == 404 => {
             return Err(ConnectError::UnknownDevice);
+        }
+        Err(tungstenite::Error::Http(resp)) if resp.status() == 401 => {
+            return Err(ConnectError::Unauthorized);
         }
         Err(e) => return Err(e.into()),
     };
@@ -396,8 +418,21 @@ async fn handshake(ws: &mut Ws, opts: &ConnectOptions) -> Result<Welcome, Connec
     };
     ws.send(Message::text(hello.to_json()?)).await?;
 
+    // A gateway that verified the signed upgrade welcomes at once; one that
+    // did not (before RFC 9421 support) sends the in-band challenge.
     let nonce = loop {
         match next_frame(ws, opts.handshake_timeout, "challenge").await? {
+            Incoming::Frame(Frame::Welcome {
+                handle,
+                device,
+                server_time,
+            }) => {
+                return Ok(Welcome {
+                    handle,
+                    device,
+                    server_time,
+                })
+            }
             Incoming::Frame(Frame::Challenge { nonce }) => break nonce,
             Incoming::Frame(Frame::Error { code, message }) => {
                 warn!(%code, message = message.as_deref().unwrap_or(""), "gateway error before challenge");

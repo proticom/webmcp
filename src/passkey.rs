@@ -1,44 +1,15 @@
 //! `webmcp passkey`: a one-time link that lets a signed-in browser add a
 //! passkey to an account without an existing one (protocol §1b). The gateway
 //! only hands it to a paired device, which proves it holds its key by signing
-//! the current time. So knowing the owner's email is not enough to enroll a
-//! passkey first.
+//! the request (RFC 9421, see [`crate::signing`]). So knowing the owner's email
+//! is not enough to enroll a passkey first.
 
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-use crate::{keys, platform};
-
-/// Prefix of the message signed for a passkey link.
-pub const SIGN_PREFIX: &str = "webmcp-passkey-link-v1\n";
-
-/// The exact bytes signed: `"webmcp-passkey-link-v1\n" + device_id + "\n" + ts`,
-/// with `ts` in decimal as sent.
-pub fn sign_message(device_id: &str, ts: u64) -> Vec<u8> {
-    format!("{SIGN_PREFIX}{device_id}\n{ts}").into_bytes()
-}
-
-/// Request body for `POST /api/v1/device/passkey-link`.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct LinkRequest {
-    pub device_id: String,
-    /// Unix seconds on this machine's clock.
-    pub ts: u64,
-    /// Standard base64 of the 64-byte Ed25519 signature.
-    pub signature: String,
-}
-
-impl LinkRequest {
-    pub fn signed(device_id: &str, key: &SigningKey, ts: u64) -> Self {
-        LinkRequest {
-            device_id: device_id.to_string(),
-            ts,
-            signature: keys::sign_b64(key, &sign_message(device_id, ts)),
-        }
-    }
-}
+use crate::{platform, signing};
 
 /// The success body: a link to open, good for `expires_in` seconds.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -151,12 +122,31 @@ pub async fn request_link(
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(transport)?;
-    let resp = client
+    let local = |detail: String| PasskeyError::Unexpected {
+        status: 0,
+        url: url.clone(),
+        body: detail,
+    };
+    let parsed = url::Url::parse(&url).map_err(|e| local(e.to_string()))?;
+    let body = b"{}";
+    let signed = signing::sign(
+        key,
+        device_id,
+        "POST",
+        &parsed,
+        Some(body),
+        ts,
+        &signing::nonce(),
+    )
+    .map_err(|e| local(e.to_string()))?;
+    let mut req = client
         .post(&url)
-        .json(&LinkRequest::signed(device_id, key, ts))
-        .send()
-        .await
-        .map_err(transport)?;
+        .header("Content-Type", "application/json")
+        .body(body.to_vec());
+    for (name, value) in signed.pairs() {
+        req = req.header(name, value);
+    }
+    let resp = req.send().await.map_err(transport)?;
     let status = resp.status().as_u16();
     let body = resp.text().await.map_err(transport)?;
     let unexpected = |body: String| PasskeyError::Unexpected {
@@ -245,11 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn signed_string_layout() {
-        assert_eq!(
-            sign_message("dev_abc", 1_790_000_000),
-            b"webmcp-passkey-link-v1\ndev_abc\n1790000000"
-        );
+    fn link_url_joins() {
         assert_eq!(
             link_url("https://webmcp.fast/"),
             "https://webmcp.fast/api/v1/device/passkey-link"

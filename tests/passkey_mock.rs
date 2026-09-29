@@ -25,6 +25,10 @@ struct Seen {
     path: String,
     user_agent: String,
     content_type: String,
+    host: String,
+    signature_input: String,
+    signature: String,
+    content_digest: String,
     body: Value,
 }
 
@@ -94,6 +98,10 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<Seen> {
         path: request_line.next()?.to_string(),
         user_agent: header("user-agent").unwrap_or_default(),
         content_type: header("content-type").unwrap_or_default(),
+        host: header("host").unwrap_or_default(),
+        signature_input: header("signature-input").unwrap_or_default(),
+        signature: header("signature").unwrap_or_default(),
+        content_digest: header("content-digest").unwrap_or_default(),
         body: serde_json::from_slice(&buf[header_end..header_end + length]).ok()?,
     })
 }
@@ -128,27 +136,36 @@ async fn a_signed_request_gets_a_link() {
     );
     assert!(req.user_agent.starts_with("webmcp-daemon/"), "{req:?}");
     assert_eq!(req.content_type, "application/json");
-    // Exactly these three fields; `ts` a number, `signature` standard base64.
-    let signature = req.body["signature"].as_str().unwrap().to_string();
+    // An empty JSON body, signed with RFC 9421 over the device key.
+    assert_eq!(req.body, json!({}));
     assert_eq!(
-        req.body,
-        json!({ "device_id": DEVICE_ID, "ts": TS, "signature": signature })
+        req.content_digest,
+        "sha-256=:RBNvo1WzZ4oRRq0W9+hknpT7T8If536DEMBg9hyq/4o=:"
     );
-    let raw = B64.decode(&signature).unwrap();
-    assert_eq!(raw.len(), 64);
-    let sig = Signature::from_slice(&raw).unwrap();
+    let params = req.signature_input.strip_prefix("webmcp=").unwrap();
+    assert!(params.starts_with(
+        "(\"@method\" \"@authority\" \"@path\" \"@query\" \"content-digest\");created=1790000000;"
+    ));
+    assert!(
+        params.contains(&format!("keyid=\"{DEVICE_ID}\""))
+            && params.contains("tag=\"webmcp-device\"")
+    );
+    let base = format!(
+        "\"@method\": POST\n\"@authority\": {}\n\"@path\": /api/v1/device/passkey-link\n\"@query\": ?\n\"content-digest\": {}\n\"@signature-params\": {params}",
+        req.host, req.content_digest
+    );
+    let b64 = req
+        .signature
+        .strip_prefix("webmcp=:")
+        .unwrap()
+        .trim_end_matches(':');
+    let sig = Signature::from_slice(&B64.decode(b64).unwrap()).unwrap();
     key.verifying_key()
-        .verify(
-            b"webmcp-passkey-link-v1\ndev_0123456789abcdef\n1790000000",
-            &sig,
-        )
-        .expect("the signature covers the documented string");
+        .verify(base.as_bytes(), &sig)
+        .expect("the signature covers the RFC 9421 signature base");
     assert!(keys::generate()
         .verifying_key()
-        .verify(
-            b"webmcp-passkey-link-v1\ndev_0123456789abcdef\n1790000000",
-            &sig
-        )
+        .verify(base.as_bytes(), &sig)
         .is_err());
 
     // What `webmcp passkey` prints, with and without --json.
