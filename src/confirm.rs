@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use tracing::{debug, info};
 
-use crate::approvals::clean_name;
+use crate::approvals::{clean_name, printable};
 
 /// How long a dialog waits before it counts as Deny.
 pub const ANSWER_WITHIN: Duration = Duration::from_secs(60);
@@ -23,17 +23,32 @@ pub struct Ask {
     pub agent: String,
     pub alias: String,
     pub tool: String,
+    /// The call's arguments, compact JSON; shown clipped.
+    pub arguments: String,
 }
+
+/// Longest argument summary a dialog shows.
+const ARGUMENTS_SHOWN: usize = 400;
 
 impl Ask {
     pub fn text(&self) -> String {
         let agent = match clean_name(&self.agent) {
             n if n.is_empty() => "An agent".to_string(),
-            n => n,
+            // The gateway reports this name; nothing on this machine checked it.
+            n => format!("An agent calling itself \"{n}\""),
         };
         let tool = clean_name(&self.tool);
+        let spaced: String = self
+            .arguments
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        let mut args = printable(spaced.trim());
+        if args.chars().count() > ARGUMENTS_SHOWN {
+            args = args.chars().take(ARGUMENTS_SHOWN).collect::<String>() + "…";
+        }
         format!(
-            "{agent} wants to run the tool \"{tool}\" on {}.\n\nAllow it this once?",
+            "{agent} wants to run the tool \"{tool}\" on {} with:\n\n{args}\n\nAllow it this once?",
             self.alias
         )
     }
@@ -139,16 +154,20 @@ mod tests {
             agent: "Claude\u{202E}exe.".into(),
             alias: "fs".into(),
             tool: "delete_file".into(),
+            arguments: "{\"path\":\"~/x\u{200B}\ny\"}".into(),
         };
         assert_eq!(
             ask.text(),
-            "Claudeexe. wants to run the tool \"delete_file\" on fs.\n\nAllow it this once?"
+            "An agent calling itself \"Claudeexe.\" wants to run the tool \"delete_file\" on fs with:\n\n{\"path\":\"~/x y\"}\n\nAllow it this once?"
         );
         let anon = Ask {
             agent: " ".into(),
+            arguments: "x".repeat(1000),
             ..ask
         };
-        assert!(anon.text().starts_with("An agent wants"));
+        let text = anon.text();
+        assert!(text.starts_with("An agent wants"));
+        assert!(text.contains(&format!("{}…\n", "x".repeat(400))));
     }
 
     #[test]

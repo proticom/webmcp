@@ -294,6 +294,11 @@ fn shown(c: char) -> bool {
     !c.is_control() && !is_format(c)
 }
 
+/// `raw` without control or format characters, any length.
+pub(crate) fn printable(raw: &str) -> String {
+    raw.chars().filter(|&c| shown(c)).collect()
+}
+
 /// A name from the gateway as it is stored and shown: control and format
 /// characters dropped, trimmed, at most `MAX_NAME_CHARS`.
 pub(crate) fn clean_name(raw: &str) -> String {

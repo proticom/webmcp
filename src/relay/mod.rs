@@ -10,7 +10,7 @@ mod sse;
 mod stdio;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -38,6 +38,9 @@ pub const DEFAULT_MAX_SESSIONS: usize = 4;
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// Messages queued per session while its backend starts or is busy.
 pub const SESSION_QUEUE: usize = 256;
+/// Confirmation dialogs open at once on this machine. With one per session
+/// too, an agent cannot bury the owner in dialogs until one gets an Allow.
+pub const MAX_OPEN_CONFIRMATIONS: usize = 2;
 
 /// `session_close.reason` values the daemon sends.
 pub mod reason {
@@ -164,6 +167,8 @@ struct SessionHandle {
     /// That credential's display name, for confirmation dialogs.
     agent: String,
     policy: Arc<Mutex<SessionPolicy>>,
+    /// A confirmation dialog for this session is open.
+    confirming: Arc<AtomicBool>,
     /// Gateway → backend messages.
     tx: mpsc::Sender<Value>,
     /// Dropping it is the close signal, seen even while `tx` is backed up.
@@ -184,6 +189,7 @@ pub struct Relay {
     sessions: Sessions,
     next_id: u64,
     confirmer: Confirmer,
+    open_confirmations: Arc<AtomicUsize>,
 }
 
 impl Relay {
@@ -213,6 +219,7 @@ impl Relay {
             sessions: Arc::default(),
             next_id: 0,
             confirmer: confirm::system(),
+            open_confirmations: Arc::default(),
         }
     }
 
@@ -350,6 +357,7 @@ impl Relay {
                 credential: credential_id,
                 agent: credential.map(|c| c.name).unwrap_or_default(),
                 policy,
+                confirming: Arc::default(),
                 tx,
                 cancel,
                 task,
@@ -378,7 +386,7 @@ impl Relay {
             Queued(Result<(), mpsc::error::TrySendError<Value>>),
             Reply(Value),
             Dropped,
-            Confirm(Ask, mpsc::Sender<Value>, Arc<Activity>),
+            Confirm(Ask, mpsc::Sender<Value>, Arc<Activity>, Arc<AtomicBool>),
         }
         let next = {
             let sessions = self.sessions.lock().expect("sessions lock");
@@ -394,12 +402,17 @@ impl Relay {
                     Inbound::Confirm { tool } => {
                         // In flight while the owner decides, so it is not evicted.
                         s.activity.note_to_backend(&msg);
+                        let arguments = msg
+                            .get("params")
+                            .and_then(|p| p.get("arguments"))
+                            .map_or_else(|| "{}".to_string(), Value::to_string);
                         let ask = Ask {
                             agent: s.agent.clone(),
                             alias: s.alias.clone(),
                             tool,
+                            arguments,
                         };
-                        Next::Confirm(ask, s.tx.clone(), s.activity.clone())
+                        Next::Confirm(ask, s.tx.clone(), s.activity.clone(), s.confirming.clone())
                     }
                 }
             })
@@ -419,23 +432,46 @@ impl Relay {
             Some(Next::Dropped) => {
                 debug!(%sid, "dropped an id-less request that is not a notification");
             }
-            Some(Next::Confirm(ask, tx, activity)) => {
+            Some(Next::Confirm(ask, tx, activity, confirming)) => {
                 let (out, confirmer) = (self.out.clone(), self.confirmer.clone());
+                let open = self.open_confirmations.clone();
                 let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                let refuse = move |why: String| {
+                    let reply = rpc_error(id.clone(), RPC_REFUSED, why);
+                    activity.note_from_backend(&reply);
+                    reply
+                };
+                // One open dialog per session and a few per machine; anything
+                // more is refused without asking.
+                let slot = !confirming.swap(true, Ordering::SeqCst);
+                let room = slot
+                    && open
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                            (n < MAX_OPEN_CONFIRMATIONS).then_some(n + 1)
+                        })
+                        .is_ok();
+                if !room {
+                    if slot {
+                        confirming.store(false, Ordering::SeqCst);
+                    }
+                    let reply = refuse(
+                        "Another call is already waiting for the owner of this machine to answer; try again after it.".into(),
+                    );
+                    send_frame(&self.out, &Frame::Mcp { sid, msg: reply }).await;
+                    return;
+                }
                 tokio::spawn(async move {
                     let tool = ask.tool.clone();
-                    if confirmer(ask).await {
+                    let allowed = confirmer(ask).await;
+                    open.fetch_sub(1, Ordering::SeqCst);
+                    confirming.store(false, Ordering::SeqCst);
+                    if allowed {
                         let _ = tx.send(msg).await;
                         return;
                     }
-                    let reply = rpc_error(
-                        id,
-                        RPC_REFUSED,
-                        format!(
-                            "The owner of this machine did not allow the tool \"{tool}\" to run."
-                        ),
-                    );
-                    activity.note_from_backend(&reply);
+                    let reply = refuse(format!(
+                        "The owner of this machine did not allow the tool \"{tool}\" to run."
+                    ));
                     send_frame(&out, &Frame::Mcp { sid, msg: reply }).await;
                 });
             }

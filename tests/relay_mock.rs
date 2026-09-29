@@ -255,7 +255,8 @@ while IFS= read -r line; do
     *'"initialize"'*)
       printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"%s","version":"0.0.1"}}}\n' "$id" "$name" ;;
     *'"tools/list"'*)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}},{"name":"wipe","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+      list='{"jsonrpc":"2.0","id":'"$id"',"result":{"tools":[{"name":"echo","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}},{"name":"wipe","inputSchema":{"type":"object"}}]}}'
+      if [ -n "${FAKE_BATCH:-}" ]; then printf '[%s]\n' "$list"; else printf '%s\n' "$list"; fi ;;
     *'"test/exit"'*)
       exit 3 ;;
     *'"test/hang"'*)
@@ -1446,4 +1447,58 @@ async fn a_tool_that_can_change_things_waits_for_the_owner() {
             "echo"
         );
     }
+}
+
+#[tokio::test]
+async fn only_one_confirmation_waits_per_session_and_it_shows_the_arguments() {
+    let fake = FakeServer::new();
+    let mut entry = fake.entry("fs", SessionMode::PerSession);
+    entry.confirm = Confirm::Always;
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let (r, a) = (release.clone(), asked.clone());
+    let confirmer: confirm::Confirmer = std::sync::Arc::new(move |ask: confirm::Ask| {
+        a.lock().unwrap().push(ask.text());
+        let r = r.clone();
+        Box::pin(async move {
+            r.notified().await;
+            true
+        })
+    });
+    let (mut gw, _daemon) = start(vec![entry], |o| o.confirmer = Some(confirmer)).await;
+    listed(&mut gw, "ses_q").await;
+
+    let first = json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"wipe","arguments":{"path":"/tmp/a"}}});
+    gw.mcp("ses_q", first);
+    eventually("the first dialog", || {
+        (!asked.lock().unwrap().is_empty()).then_some(())
+    })
+    .await;
+    gw.mcp("ses_q", call_tool(4, "wipe"));
+    let second = gw.recv_mcp("ses_q").await;
+    assert_eq!(second["id"], 4);
+    assert_eq!(
+        second["error"]["message"],
+        "Another call is already waiting for the owner of this machine to answer; try again after it."
+    );
+    assert!(asked.lock().unwrap()[0].contains("with:\n\n{\"path\":\"/tmp/a\"}"));
+
+    release.notify_one();
+    let allowed = gw.recv_mcp("ses_q").await;
+    assert_eq!(allowed["id"], 3);
+    assert_eq!(
+        allowed["result"]["echo"]["params"]["arguments"]["path"],
+        "/tmp/a"
+    );
+    assert_eq!(asked.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_batched_tools_list_answer_is_filtered_too() {
+    let fake = FakeServer::new();
+    let mut entry = fake.entry("fs", SessionMode::PerSession);
+    entry.tools = ToolPolicy::ReadOnly;
+    entry.env.insert("FAKE_BATCH".into(), "1".into());
+    let (mut gw, _daemon) = start(vec![entry], |_| {}).await;
+    assert_eq!(listed(&mut gw, "ses_b").await, ["echo"]);
 }

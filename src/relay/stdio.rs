@@ -234,7 +234,17 @@ async fn forward(ctx: &SessionCtx, line: &[u8]) -> bool {
         return true;
     }
     match serde_json::from_slice::<Value>(line) {
-        Ok(msg) if msg.is_object() || msg.is_array() => ctx.emit(msg).await,
+        Ok(Value::Array(batch)) => {
+            // One message at a time, so a batched tools/list answer is
+            // filtered like any other.
+            for msg in batch.into_iter().filter(Value::is_object) {
+                if !ctx.emit(msg).await {
+                    return false;
+                }
+            }
+            true
+        }
+        Ok(msg) if msg.is_object() => ctx.emit(msg).await,
         _ => {
             debug!(
                 sid = %ctx.sid,

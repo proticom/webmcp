@@ -121,7 +121,11 @@ dialog, the answer is Deny.
 A stdio server starts with a clean environment: `PATH`, `HOME`, the user and shell names, locale, temp
 directories, proxy and CA-bundle variables, plus whatever its `--env` sets. Keys in your shell such as
 `AWS_*` or `GITHUB_TOKEN` are not passed on, because an agent can often make a server print its
-environment. Name a variable with `--env` to give it to one server.
+environment. Name a variable with `--env` to give it to one server. That includes what a server may
+need from your session and no longer gets by default, such as `SSH_AUTH_SOCK` for git over ssh,
+`DISPLAY` or `WAYLAND_DISPLAY` for a GUI, or `VIRTUAL_ENV` and `JAVA_HOME`:
+
+    webmcp attach repo --env SSH_AUTH_SOCK="$SSH_AUTH_SOCK" -- npx -y @scope/git-server
 
 Only one `webmcp connect` runs per device: it holds a lock (`daemon.lock` in the config directory) and a
 second one exits naming the first one's pid. If another machine connects with a copy of this identity,

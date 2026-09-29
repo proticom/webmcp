@@ -181,6 +181,10 @@ pub enum ConnectError {
     Eof,
     #[error("protocol error during handshake: {0}")]
     Handshake(String),
+    #[error(
+        "the gateway says this machine's clock is more than 5 minutes off; correct it (retrying)"
+    )]
+    ClockSkew,
     #[error("handshake timed out waiting for {0}")]
     Timeout(&'static str),
     #[error("{0} pongs missed; connection considered dead")]
@@ -301,8 +305,21 @@ async fn connection(
         Err(tungstenite::Error::Http(resp)) if resp.status() == 404 => {
             return Err(ConnectError::UnknownDevice);
         }
-        Err(tungstenite::Error::Http(resp)) if resp.status() == 401 => {
-            return Err(ConnectError::Unauthorized);
+        Err(tungstenite::Error::Http(resp)) => {
+            let code = resp
+                .body()
+                .as_deref()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string));
+            return Err(match (resp.status().as_u16(), code.as_deref()) {
+                (400, Some("clock_skew")) => ConnectError::ClockSkew,
+                // A bad signature means the gateway holds a different key.
+                (401, Some("bad_signature")) => ConnectError::Unauthorized,
+                (status, code) => ConnectError::Handshake(format!(
+                    "upgrade refused with HTTP {status}{}",
+                    code.map(|c| format!(" ({c})")).unwrap_or_default()
+                )),
+            });
         }
         Err(e) => return Err(e.into()),
     };

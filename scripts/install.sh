@@ -75,14 +75,15 @@ fi
 # The checksum only catches a damaged download: SHA256SUMS comes from the same
 # release. The attestation shows the file was built by this repo's workflow.
 if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
-  gh attestation verify "$tmp/$name.tar.gz" --repo "$REPO" >/dev/null 2>&1 ||
+  gh attestation verify "$tmp/$name.tar.gz" --repo "$REPO" \
+    --signer-workflow "$REPO/.github/workflows/release.yml" >/dev/null 2>&1 ||
     die "build provenance did not verify for $name.tar.gz (releases before v0.3.0 have none)"
   say "Verified build provenance: built by $REPO's release workflow"
 elif [ "${WEBMCP_REQUIRE_ATTESTATION:-}" = "1" ]; then
   die "WEBMCP_REQUIRE_ATTESTATION=1 needs the GitHub CLI (gh), signed in"
 else
   say "Checksum verified. To also verify who built it, install the GitHub CLI and run:"
-  say "    gh attestation verify $name.tar.gz --repo $REPO"
+  say "    gh attestation verify $name.tar.gz --repo $REPO --signer-workflow $REPO/.github/workflows/release.yml"
 fi
 
 tar -xzf "$tmp/$name.tar.gz" -C "$tmp"
