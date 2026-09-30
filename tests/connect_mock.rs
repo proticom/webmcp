@@ -370,3 +370,77 @@ async fn reconnects_after_a_dropped_connection() {
     }
     assert!(saw_ping);
 }
+
+/// A gateway that proves the device from its signed upgrade (RFC 9421) and
+/// welcomes it right after hello, with no challenge.
+#[tokio::test]
+async fn a_signed_upgrade_is_welcomed_without_a_challenge() {
+    let key = keys::generate();
+    let trusted = key.verifying_key();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (verdict_tx, mut verdict_rx) = mpsc::unbounded_channel::<bool>();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let callback = move |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
+            let header = |n: &str| {
+                req.headers()
+                    .get(n)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let params = header("signature-input")
+                .strip_prefix("webmcp=")
+                .unwrap_or("")
+                .to_string();
+            let base = format!(
+                "\"@method\": GET\n\"@authority\": {}\n\"@path\": {}\n\"@query\": ?{}\n\"@signature-params\": {params}",
+                header("host"),
+                req.uri().path(),
+                req.uri().query().unwrap_or("")
+            );
+            let sig = header("signature");
+            let raw = B64
+                .decode(sig.trim_start_matches("webmcp=:").trim_end_matches(':'))
+                .unwrap_or_default();
+            let ok = params.contains(&format!("keyid=\"{DEVICE_ID}\""))
+                && Signature::from_slice(&raw)
+                    .map(|s| trusted.verify(base.as_bytes(), &s).is_ok())
+                    .unwrap_or(false);
+            let _ = verdict_tx.send(ok);
+            Ok(resp)
+        };
+        let mut ws = tokio_tungstenite::accept_hdr_async(stream, callback)
+            .await
+            .unwrap();
+        let _hello = ws.next().await;
+        let welcome = Frame::Welcome {
+            handle: "alice".into(),
+            device: "macbook".into(),
+            server_time: "2026-09-29T21:00:00Z".into(),
+        };
+        ws.send(Message::text(welcome.to_json().unwrap()))
+            .await
+            .unwrap();
+        while let Some(Ok(m)) = ws.next().await {
+            if let Message::Text(t) = &m {
+                if t.as_str() == PING {
+                    ws.send(Message::text(PONG)).await.unwrap();
+                }
+            }
+        }
+    });
+
+    let opts = fast_opts(&format!("ws://{addr}/connect"), key);
+    let welcome = tokio::time::timeout(Duration::from_secs(10), connect::run(&opts))
+        .await
+        .expect("did not hang")
+        .expect("welcomed on the signed upgrade");
+    assert_eq!(welcome.handle, "alice");
+    assert_eq!(
+        verdict_rx.recv().await,
+        Some(true),
+        "the upgrade signature verifies"
+    );
+}

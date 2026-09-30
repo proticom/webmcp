@@ -1,9 +1,12 @@
 #!/bin/sh
 # Install the webmcp daemon from its GitHub release.
 #   curl -fsSL https://github.com/proticom/webmcp/releases/latest/download/install.sh | sh
-# Environment: WEBMCP_VERSION (default: latest), WEBMCP_INSTALL_DIR (default: ~/.local/bin).
-# It downloads one tarball and the release's SHA256SUMS over HTTPS, verifies the checksum,
-# and copies one binary. It never uses sudo and changes nothing else.
+# Environment: WEBMCP_VERSION (default: latest), WEBMCP_INSTALL_DIR (default: ~/.local/bin),
+# WEBMCP_REQUIRE_ATTESTATION=1 (fail unless build provenance verifies).
+# It downloads one tarball and the release's SHA256SUMS over HTTPS and verifies the checksum.
+# If the GitHub CLI is installed and signed in, it also verifies the tarball's build provenance
+# attestation: proof, signed through Sigstore, that this repo's release workflow built it.
+# It copies one binary, never uses sudo and changes nothing else.
 set -eu
 
 REPO="proticom/webmcp"
@@ -68,6 +71,20 @@ else
   die "need shasum or sha256sum to verify the download"
 fi
 [ "$want" = "$got" ] || die "checksum mismatch: expected $want, got $got"
+
+# The checksum only catches a damaged download: SHA256SUMS comes from the same
+# release. The attestation shows the file was built by this repo's workflow.
+if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+  gh attestation verify "$tmp/$name.tar.gz" --repo "$REPO" \
+    --signer-workflow "$REPO/.github/workflows/release.yml" >/dev/null 2>&1 ||
+    die "build provenance did not verify for $name.tar.gz (releases before v0.3.0 have none)"
+  say "Verified build provenance: built by $REPO's release workflow"
+elif [ "${WEBMCP_REQUIRE_ATTESTATION:-}" = "1" ]; then
+  die "WEBMCP_REQUIRE_ATTESTATION=1 needs the GitHub CLI (gh), signed in"
+else
+  say "Checksum verified. To also verify who built it, install the GitHub CLI and run:"
+  say "    gh attestation verify $name.tar.gz --repo $REPO --signer-workflow $REPO/.github/workflows/release.yml"
+fi
 
 tar -xzf "$tmp/$name.tar.gz" -C "$tmp"
 mkdir -p "$DIR"

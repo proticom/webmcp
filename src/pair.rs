@@ -38,6 +38,37 @@ pub struct PairResponse {
     pub device_name: Option<String>,
 }
 
+/// The gateway's pair answer names where the device connects from now on.
+/// Accept it only on the host the user chose (the relay may sit on a
+/// subdomain of it) and only over TLS, so a bad answer cannot move the device
+/// to plaintext or to someone else's server. Plain `http`/`ws` is allowed for
+/// a loopback base URL, which is local development.
+pub fn check_endpoints(requested_base: &str, resp: &PairResponse) -> Result<(), Error> {
+    let invalid = |field: &'static str, reason: String| Error::Invalid { field, reason };
+    let requested = url::Url::parse(requested_base)
+        .map_err(|e| invalid("base URL", format!("{requested_base}: {e}")))?;
+    let host = requested
+        .host_str()
+        .ok_or_else(|| invalid("base URL", format!("{requested_base} has no host")))?
+        .to_ascii_lowercase();
+    let local = matches!(host.as_str(), "localhost" | "127.0.0.1" | "[::1]" | "::1");
+    let check = |field: &'static str, raw: &str, secure: &str, plain: &str, subdomain_ok: bool| {
+        let u = url::Url::parse(raw).map_err(|e| invalid(field, format!("{raw}: {e}")))?;
+        let scheme_ok = u.scheme() == secure || (local && u.scheme() == plain);
+        if !scheme_ok {
+            return Err(invalid(field, format!("{raw} must use {secure}://")));
+        }
+        let h = u.host_str().unwrap_or_default().to_ascii_lowercase();
+        let host_ok = h == host || (subdomain_ok && h.ends_with(&format!(".{host}")));
+        if !host_ok {
+            return Err(invalid(field, format!("{raw} is not on {host}")));
+        }
+        Ok(())
+    };
+    check("base_url", &resp.base_url, "https", "http", false)?;
+    check("relay_url", &resp.relay_url, "wss", "ws", true)
+}
+
 /// Persist a fresh pairing: the key first (a config without a key is
 /// useless, the reverse is harmless), then the config. Shared by `login` and
 /// `up`. `previous` is the config a re-pair replaces: its attached servers
@@ -46,11 +77,13 @@ pub struct PairResponse {
 pub fn persist(
     dir: &Path,
     key: &SigningKey,
+    requested_base: &str,
     resp: PairResponse,
     requested_name: String,
     hardware_id: String,
     previous: Option<Config>,
 ) -> Result<Config, Error> {
+    check_endpoints(requested_base, &resp)?;
     keys::save(dir, key)?;
     let (servers, require_approval, approved) = previous
         .map(|p| (p.servers, p.require_approval, p.approved))
@@ -228,6 +261,7 @@ mod tests {
         let mut first = persist(
             dir.path(),
             &key,
+            "https://webmcp.fast",
             resp("dev_1"),
             "mac".into(),
             "00".into(),
@@ -247,6 +281,7 @@ mod tests {
         let again = persist(
             dir.path(),
             &key,
+            "https://webmcp.fast",
             resp("dev_2"),
             "mac".into(),
             "00".into(),
@@ -259,5 +294,60 @@ mod tests {
             (again.servers, again.approved),
             (first.servers, first.approved)
         );
+    }
+
+    #[test]
+    fn pair_answers_must_stay_on_the_chosen_host_and_on_tls() {
+        let resp = |base: &str, relay: &str| PairResponse {
+            device_id: "dev_1".into(),
+            handle: "alice".into(),
+            org_id: None,
+            relay_url: relay.into(),
+            base_url: base.into(),
+            device_name: None,
+        };
+        let ok =
+            |req: &str, base: &str, relay: &str| check_endpoints(req, &resp(base, relay)).is_ok();
+        assert!(ok(
+            "https://webmcp.fast",
+            "https://webmcp.fast",
+            "wss://webmcp.fast/connect"
+        ));
+        assert!(ok(
+            "https://webmcp.fast/",
+            "https://WebMCP.fast",
+            "wss://relay.webmcp.fast/connect"
+        ));
+        assert!(ok(
+            "http://localhost:8788",
+            "http://localhost:8788",
+            "ws://localhost:8788/connect"
+        ));
+        // Plaintext on a public host, another host, a lookalike suffix.
+        assert!(!ok(
+            "https://webmcp.fast",
+            "https://webmcp.fast",
+            "ws://webmcp.fast/connect"
+        ));
+        assert!(!ok(
+            "https://webmcp.fast",
+            "http://webmcp.fast",
+            "wss://webmcp.fast/connect"
+        ));
+        assert!(!ok(
+            "https://webmcp.fast",
+            "https://webmcp.fast",
+            "wss://evil.example/connect"
+        ));
+        assert!(!ok(
+            "https://webmcp.fast",
+            "https://webmcp.fast",
+            "wss://evilwebmcp.fast/connect"
+        ));
+        assert!(!ok(
+            "https://webmcp.fast",
+            "https://sub.webmcp.fast",
+            "wss://webmcp.fast/connect"
+        ));
     }
 }

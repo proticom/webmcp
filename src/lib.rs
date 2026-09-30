@@ -6,6 +6,7 @@
 
 pub mod approvals;
 pub mod config;
+pub mod confirm;
 pub mod connect;
 pub mod device_auth;
 pub mod discover;
@@ -16,9 +17,11 @@ pub mod output;
 pub mod pair;
 pub mod passkey;
 pub mod platform;
+pub mod policy;
 pub mod proto;
 pub mod relay;
 pub mod reload;
 pub mod service;
+pub mod signing;
 
 pub use error::Error;

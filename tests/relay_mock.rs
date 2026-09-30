@@ -19,8 +19,10 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use webmcp_daemon::approvals::{self, Agents};
 use webmcp_daemon::config::{ApprovedCredential, Config, ServerEntry};
+use webmcp_daemon::confirm;
 use webmcp_daemon::connect::{self, ConnectOptions};
 use webmcp_daemon::keys;
+use webmcp_daemon::policy::{Confirm, ToolPolicy};
 use webmcp_daemon::proto::{
     connect_sign_message, ClientInfo, Credential, CredentialKind, Frame, ServerStatus, SessionMode,
     PING, PONG,
@@ -253,7 +255,8 @@ while IFS= read -r line; do
     *'"initialize"'*)
       printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"%s","version":"0.0.1"}}}\n' "$id" "$name" ;;
     *'"tools/list"'*)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+      list='{"jsonrpc":"2.0","id":'"$id"',"result":{"tools":[{"name":"echo","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}},{"name":"wipe","inputSchema":{"type":"object"}}]}}'
+      if [ -n "${FAKE_BATCH:-}" ]; then printf '[%s]\n' "$list"; else printf '%s\n' "$list"; fi ;;
     *'"test/exit"'*)
       exit 3 ;;
     *'"test/hang"'*)
@@ -416,7 +419,11 @@ async fn per_session_servers_get_one_process_each_and_exit_is_reported() {
     assert_ne!(pids[0], pids[1]);
 
     // The server behind ses_a exits on its own.
-    gw.mcp("ses_a", json!({"jsonrpc":"2.0","method":"test/exit"}));
+    // With an id: an id-less request that is not a notification is dropped.
+    gw.mcp(
+        "ses_a",
+        json!({"jsonrpc":"2.0","id":9,"method":"test/exit"}),
+    );
     assert_eq!(gw.recv_close("ses_a").await, "server_exited");
     assert_dies(pids[0]).await;
 
@@ -784,7 +791,7 @@ async fn http_backend_relays_json_sse_202_and_deletes_on_close() {
     // A JSON-RPC error with a 4xx status is an answer, not a dead upstream.
     gw.mcp(
         "ses_h",
-        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo"}}),
     );
     let err = gw.recv_mcp("ses_h").await;
     assert_eq!(err["id"], 3);
@@ -1372,4 +1379,126 @@ async fn turning_approvals_on_keeping_existing_agents_leaves_their_sessions_alon
         Config::load_from(live.dir()).unwrap().approved[0].id,
         "grt_a"
     );
+}
+
+// ------------------------------------------------------ this machine's policy
+
+fn call_tool(id: u64, name: &str) -> Value {
+    json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":{}}})
+}
+
+async fn listed(gw: &mut Gateway, sid: &str) -> Vec<String> {
+    gw.open(sid, "fs");
+    gw.mcp(sid, initialize(1));
+    assert_eq!(gw.recv_mcp(sid).await["id"], 1);
+    gw.mcp(sid, json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}));
+    let tools = gw.recv_mcp(sid).await;
+    tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_read_only_server_hides_and_refuses_other_tools_whatever_the_gateway_sends() {
+    let fake = FakeServer::new();
+    let mut entry = fake.entry("fs", SessionMode::PerSession);
+    entry.tools = ToolPolicy::ReadOnly;
+    let (mut gw, _daemon) = start(vec![entry], |_| {}).await;
+
+    assert_eq!(listed(&mut gw, "ses_p").await, ["echo"]);
+    gw.mcp("ses_p", call_tool(3, "wipe"));
+    let refused = gw.recv_mcp("ses_p").await;
+    assert_eq!(refused["id"], 3);
+    assert_eq!(refused["error"]["code"], -32001);
+    // The allowed tool still reaches the server, which echoes it back.
+    gw.mcp("ses_p", call_tool(4, "echo"));
+    let echoed = gw.recv_mcp("ses_p").await;
+    assert_eq!(echoed["result"]["echo"]["params"]["name"], "echo");
+}
+
+#[tokio::test]
+async fn a_tool_that_can_change_things_waits_for_the_owner() {
+    for (allow, expect_echo) in [(false, false), (true, true)] {
+        let fake = FakeServer::new();
+        let mut entry = fake.entry("fs", SessionMode::PerSession);
+        entry.confirm = Confirm::Destructive;
+        let (mut gw, _daemon) =
+            start(vec![entry], |o| o.confirmer = Some(confirm::fixed(allow))).await;
+
+        assert_eq!(listed(&mut gw, "ses_c").await, ["echo", "wipe"]);
+        gw.mcp("ses_c", call_tool(3, "wipe"));
+        let answer = gw.recv_mcp("ses_c").await;
+        assert_eq!(answer["id"], 3);
+        if expect_echo {
+            assert_eq!(answer["result"]["echo"]["params"]["name"], "wipe");
+        } else {
+            assert_eq!(
+                answer["error"]["message"],
+                "The owner of this machine did not allow the tool \"wipe\" to run."
+            );
+        }
+        // A read-only tool never asks.
+        gw.mcp("ses_c", call_tool(4, "echo"));
+        assert_eq!(
+            gw.recv_mcp("ses_c").await["result"]["echo"]["params"]["name"],
+            "echo"
+        );
+    }
+}
+
+#[tokio::test]
+async fn only_one_confirmation_waits_per_session_and_it_shows_the_arguments() {
+    let fake = FakeServer::new();
+    let mut entry = fake.entry("fs", SessionMode::PerSession);
+    entry.confirm = Confirm::Always;
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let (r, a) = (release.clone(), asked.clone());
+    let confirmer: confirm::Confirmer = std::sync::Arc::new(move |ask: confirm::Ask| {
+        a.lock().unwrap().push(ask.text());
+        let r = r.clone();
+        Box::pin(async move {
+            r.notified().await;
+            true
+        })
+    });
+    let (mut gw, _daemon) = start(vec![entry], |o| o.confirmer = Some(confirmer)).await;
+    listed(&mut gw, "ses_q").await;
+
+    let first = json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"wipe","arguments":{"path":"/tmp/a"}}});
+    gw.mcp("ses_q", first);
+    eventually("the first dialog", || {
+        (!asked.lock().unwrap().is_empty()).then_some(())
+    })
+    .await;
+    gw.mcp("ses_q", call_tool(4, "wipe"));
+    let second = gw.recv_mcp("ses_q").await;
+    assert_eq!(second["id"], 4);
+    assert_eq!(
+        second["error"]["message"],
+        "Another call is already waiting for the owner of this machine to answer; try again after it."
+    );
+    assert!(asked.lock().unwrap()[0].contains("with:\n\n{\"path\":\"/tmp/a\"}"));
+
+    release.notify_one();
+    let allowed = gw.recv_mcp("ses_q").await;
+    assert_eq!(allowed["id"], 3);
+    assert_eq!(
+        allowed["result"]["echo"]["params"]["arguments"]["path"],
+        "/tmp/a"
+    );
+    assert_eq!(asked.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_batched_tools_list_answer_is_filtered_too() {
+    let fake = FakeServer::new();
+    let mut entry = fake.entry("fs", SessionMode::PerSession);
+    entry.tools = ToolPolicy::ReadOnly;
+    entry.env.insert("FAKE_BATCH".into(), "1".into());
+    let (mut gw, _daemon) = start(vec![entry], |_| {}).await;
+    assert_eq!(listed(&mut gw, "ses_b").await, ["echo"]);
 }

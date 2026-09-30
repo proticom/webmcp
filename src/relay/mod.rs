@@ -10,7 +10,7 @@ mod sse;
 mod stdio;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -22,7 +22,9 @@ use tracing::{debug, info, warn};
 
 use crate::approvals::{Admission, Recorder};
 use crate::config::ServerEntry;
+use crate::confirm::{self, Ask, Confirmer};
 use crate::platform;
+use crate::policy::{rpc_error, Inbound, SessionPolicy, RPC_REFUSED};
 use crate::proto::{ClientInfo, Credential, Frame, SessionMode, Transport};
 
 /// Largest `mcp` frame accepted from the gateway (wire bytes).
@@ -36,6 +38,9 @@ pub const DEFAULT_MAX_SESSIONS: usize = 4;
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// Messages queued per session while its backend starts or is busy.
 pub const SESSION_QUEUE: usize = 256;
+/// Confirmation dialogs open at once on this machine. With one per session
+/// too, an agent cannot bury the owner in dialogs until one gets an Allow.
+pub const MAX_OPEN_CONFIRMATIONS: usize = 2;
 
 /// `session_close.reason` values the daemon sends.
 pub mod reason {
@@ -135,12 +140,15 @@ pub(crate) struct SessionCtx {
     pub idle_timeout: Duration,
     out: mpsc::Sender<Message>,
     activity: Arc<Activity>,
+    policy: Arc<Mutex<SessionPolicy>>,
 }
 
 impl SessionCtx {
-    /// Send one backend message to the gateway as an `mcp` frame. `false`
-    /// means the connection is gone and the session should stop.
+    /// Send one backend message to the gateway as an `mcp` frame, after this
+    /// machine's tool policy has filtered it. `false` means the connection
+    /// is gone and the session should stop.
     pub async fn emit(&self, msg: Value) -> bool {
+        let msg = self.policy.lock().expect("policy lock").outbound(msg);
         self.activity.note_from_backend(&msg);
         let frame = Frame::Mcp {
             sid: self.sid.clone(),
@@ -156,6 +164,11 @@ struct SessionHandle {
     alias: String,
     /// Id of the agent credential that opened it, if the gateway said.
     credential: Option<String>,
+    /// That credential's display name, for confirmation dialogs.
+    agent: String,
+    policy: Arc<Mutex<SessionPolicy>>,
+    /// A confirmation dialog for this session is open.
+    confirming: Arc<AtomicBool>,
     /// Gateway → backend messages.
     tx: mpsc::Sender<Value>,
     /// Dropping it is the close signal, seen even while `tx` is backed up.
@@ -175,6 +188,8 @@ pub struct Relay {
     http: reqwest::Client,
     sessions: Sessions,
     next_id: u64,
+    confirmer: Confirmer,
+    open_confirmations: Arc<AtomicUsize>,
 }
 
 impl Relay {
@@ -203,7 +218,15 @@ impl Relay {
             http,
             sessions: Arc::default(),
             next_id: 0,
+            confirmer: confirm::system(),
+            open_confirmations: Arc::default(),
         }
+    }
+
+    /// Answer confirmations with `confirmer` instead of the desktop dialog.
+    pub fn with_confirmer(mut self, confirmer: Confirmer) -> Self {
+        self.confirmer = confirmer;
+        self
     }
 
     /// Number of live sessions.
@@ -288,12 +311,17 @@ impl Relay {
         let (tx, rx) = mpsc::channel(SESSION_QUEUE);
         let (cancel, cancelled) = oneshot::channel();
         let activity = Arc::new(Activity::new());
+        let policy = Arc::new(Mutex::new(SessionPolicy::new(
+            entry.tools.clone(),
+            entry.confirm,
+        )));
         let ctx = SessionCtx {
             sid: sid.clone(),
             alias: server.clone(),
             idle_timeout: self.opts.idle_timeout,
             out: self.out.clone(),
             activity: activity.clone(),
+            policy: policy.clone(),
         };
         let sessions = self.sessions.clone();
         let http = self.http.clone();
@@ -327,6 +355,9 @@ impl Relay {
                 id,
                 alias: server,
                 credential: credential_id,
+                agent: credential.map(|c| c.name).unwrap_or_default(),
+                policy,
+                confirming: Arc::default(),
                 tx,
                 cancel,
                 task,
@@ -347,23 +378,103 @@ impl Relay {
         sessions.remove(&sid).map(|h| (sid, h))
     }
 
-    /// `mcp`: queue one message for the session's backend.
+    /// `mcp`: judge one message by this machine's tool policy, then queue it
+    /// for the session's backend, answer it with a refusal, or hold it for the
+    /// owner's confirmation.
     pub async fn deliver(&mut self, sid: String, msg: Value) {
-        let queued = {
+        enum Next {
+            Queued(Result<(), mpsc::error::TrySendError<Value>>),
+            Reply(Value),
+            Dropped,
+            Confirm(Ask, mpsc::Sender<Value>, Arc<Activity>, Arc<AtomicBool>),
+        }
+        let next = {
             let sessions = self.sessions.lock().expect("sessions lock");
             sessions.get(&sid).map(|s| {
-                s.activity.note_to_backend(&msg);
-                s.tx.try_send(msg)
+                let verdict = s.policy.lock().expect("policy lock").inbound(&msg);
+                match verdict {
+                    Inbound::Forward => {
+                        s.activity.note_to_backend(&msg);
+                        Next::Queued(s.tx.try_send(msg.clone()))
+                    }
+                    Inbound::Refuse(reply) => Next::Reply(reply),
+                    Inbound::Drop => Next::Dropped,
+                    Inbound::Confirm { tool } => {
+                        // In flight while the owner decides, so it is not evicted.
+                        s.activity.note_to_backend(&msg);
+                        let arguments = msg
+                            .get("params")
+                            .and_then(|p| p.get("arguments"))
+                            .map_or_else(|| "{}".to_string(), Value::to_string);
+                        let ask = Ask {
+                            agent: s.agent.clone(),
+                            alias: s.alias.clone(),
+                            tool,
+                            arguments,
+                        };
+                        Next::Confirm(ask, s.tx.clone(), s.activity.clone(), s.confirming.clone())
+                    }
+                }
             })
         };
-        match queued {
-            Some(Ok(())) => {}
-            Some(Err(mpsc::error::TrySendError::Full(_))) => {
+        match next {
+            Some(Next::Queued(Ok(()))) => {}
+            Some(Next::Queued(Err(mpsc::error::TrySendError::Full(_)))) => {
                 warn!(%sid, "backend is not keeping up; closing session");
                 self.fail(&sid, reason::OVERLOADED).await;
             }
             // The backend task just ended and is reporting that itself.
-            Some(Err(mpsc::error::TrySendError::Closed(_))) => {}
+            Some(Next::Queued(Err(mpsc::error::TrySendError::Closed(_)))) => {}
+            Some(Next::Reply(reply)) => {
+                info!(%sid, "tool call refused by this machine's policy");
+                send_frame(&self.out, &Frame::Mcp { sid, msg: reply }).await;
+            }
+            Some(Next::Dropped) => {
+                debug!(%sid, "dropped an id-less request that is not a notification");
+            }
+            Some(Next::Confirm(ask, tx, activity, confirming)) => {
+                let (out, confirmer) = (self.out.clone(), self.confirmer.clone());
+                let open = self.open_confirmations.clone();
+                let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                let refuse = move |why: String| {
+                    let reply = rpc_error(id.clone(), RPC_REFUSED, why);
+                    activity.note_from_backend(&reply);
+                    reply
+                };
+                // One open dialog per session and a few per machine; anything
+                // more is refused without asking.
+                let slot = !confirming.swap(true, Ordering::SeqCst);
+                let room = slot
+                    && open
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                            (n < MAX_OPEN_CONFIRMATIONS).then_some(n + 1)
+                        })
+                        .is_ok();
+                if !room {
+                    if slot {
+                        confirming.store(false, Ordering::SeqCst);
+                    }
+                    let reply = refuse(
+                        "Another call is already waiting for the owner of this machine to answer; try again after it.".into(),
+                    );
+                    send_frame(&self.out, &Frame::Mcp { sid, msg: reply }).await;
+                    return;
+                }
+                tokio::spawn(async move {
+                    let tool = ask.tool.clone();
+                    let allowed = confirmer(ask).await;
+                    open.fetch_sub(1, Ordering::SeqCst);
+                    confirming.store(false, Ordering::SeqCst);
+                    if allowed {
+                        let _ = tx.send(msg).await;
+                        return;
+                    }
+                    let reply = refuse(format!(
+                        "The owner of this machine did not allow the tool \"{tool}\" to run."
+                    ));
+                    send_frame(&out, &Frame::Mcp { sid, msg: reply }).await;
+                });
+            }
             None => {
                 debug!(%sid, "mcp frame for an unknown session");
                 self.refuse(&sid, reason::UNKNOWN_SESSION).await;

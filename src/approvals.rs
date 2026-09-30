@@ -277,10 +277,32 @@ pub fn is_valid_id(id: &str) -> bool {
     (1..=128).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_graphic())
 }
 
-/// A name from the gateway as it is stored and shown: control characters
-/// dropped, trimmed, at most `MAX_NAME_CHARS`.
-fn clean_name(raw: &str) -> String {
-    let kept: String = raw.chars().filter(|c| !c.is_control()).collect();
+/// Unicode format characters (general category Cf): bidi overrides and
+/// isolates, zero-width joiners and spaces, tag characters. None prints, and
+/// bidi overrides can reorder what does, so a name could read as something it
+/// is not (Trojan Source, CVE-2021-42574).
+fn is_format(c: char) -> bool {
+    matches!(c,
+        '\u{AD}' | '\u{600}'..='\u{605}' | '\u{61C}' | '\u{6DD}' | '\u{70F}' | '\u{890}'..='\u{891}'
+        | '\u{8E2}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}'
+        | '\u{110BD}' | '\u{110CD}' | '\u{13430}'..='\u{1343F}' | '\u{1BCA0}'..='\u{1BCA3}'
+        | '\u{1D173}'..='\u{1D17A}' | '\u{E0001}' | '\u{E0020}'..='\u{E007F}')
+}
+
+fn shown(c: char) -> bool {
+    !c.is_control() && !is_format(c)
+}
+
+/// `raw` without control or format characters, any length.
+pub(crate) fn printable(raw: &str) -> String {
+    raw.chars().filter(|&c| shown(c)).collect()
+}
+
+/// A name from the gateway as it is stored and shown: control and format
+/// characters dropped, trimmed, at most `MAX_NAME_CHARS`.
+pub(crate) fn clean_name(raw: &str) -> String {
+    let kept: String = raw.chars().filter(|&c| shown(c)).collect();
     let cut: String = kept.trim().chars().take(MAX_NAME_CHARS).collect();
     cut.trim_end().to_string()
 }
@@ -289,7 +311,7 @@ fn notification_text(name: &str, alias: &str) -> String {
     // notify-send servers may read the body as markup.
     let name: String = name
         .chars()
-        .filter(|c| !c.is_control() && !matches!(c, '<' | '>' | '&'))
+        .filter(|&c| shown(c) && !matches!(c, '<' | '>' | '&'))
         .collect();
     let name = match name.trim() {
         "" => "An agent",
@@ -471,6 +493,17 @@ pub fn revoke(dir: &Path, id: &str) -> Result<ApprovedCredential, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_lose_bidi_and_zero_width_characters() {
+        // "Claude" + RLO + reversed text + PDF, with a zero-width space and a tag char.
+        let raw = "Clau\u{200B}de \u{202E}lmth.exe\u{202C} \u{E0041}(usual)";
+        assert_eq!(clean_name(raw), "Claude lmth.exe (usual)");
+        assert_eq!(
+            notification_text("\u{2066}Evil\u{2069} <b>", "fs"),
+            "Evil b wants to use fs on this machine. Run: webmcp approve"
+        );
+    }
 
     /// 2026-09-21T14:13:20Z.
     const T0: u64 = 1_790_000_000;

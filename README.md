@@ -103,6 +103,29 @@ gateway's code (`bad_signature`, `clock_skew`, `unknown_device`, `rate_limited`,
     webmcp attach gnosys --stdio "npx -y @acme/gnosys"     # same, command as one quoted string
     webmcp attach web --http http://localhost:3000/mcp --mode shared
     webmcp servers / webmcp detach <alias>
+    webmcp tools <alias> [all | read-only | allow <name>...]
+    webmcp confirm <alias> [never | destructive | always]
+
+### Tool permissions on this machine
+
+    webmcp tools fs read-only               # only tools the server marks read-only
+    webmcp tools fs allow read_file list_dir
+    webmcp confirm fs destructive           # Allow/Deny dialog before tools that can change things
+
+These rules are enforced by the daemon, whatever the gateway sends: a tool this machine does not allow
+never reaches the server and never appears in `tools/list`. The dashboard can narrow them further, never
+widen them. `confirm destructive` asks for tools that are not marked read-only or harmless (MCP treats an
+unmarked tool as able to change things); unanswered for 60 seconds, or with no desktop session to show the
+dialog, the answer is Deny.
+
+A stdio server starts with a clean environment: `PATH`, `HOME`, the user and shell names, locale, temp
+directories, proxy and CA-bundle variables, plus whatever its `--env` sets. Keys in your shell such as
+`AWS_*` or `GITHUB_TOKEN` are not passed on, because an agent can often make a server print its
+environment. Name a variable with `--env` to give it to one server. That includes what a server may
+need from your session and no longer gets by default, such as `SSH_AUTH_SOCK` for git over ssh,
+`DISPLAY` or `WAYLAND_DISPLAY` for a GUI, or `VIRTUAL_ENV` and `JAVA_HOME`:
+
+    webmcp attach repo --env SSH_AUTH_SOCK="$SSH_AUTH_SOCK" -- npx -y @scope/git-server
 
 Only one `webmcp connect` runs per device: it holds a lock (`daemon.lock` in the config directory) and a
 second one exits naming the first one's pid. If another machine connects with a copy of this identity,

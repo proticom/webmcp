@@ -1,44 +1,15 @@
 //! `webmcp passkey`: a one-time link that lets a signed-in browser add a
 //! passkey to an account without an existing one (protocol §1b). The gateway
 //! only hands it to a paired device, which proves it holds its key by signing
-//! the current time. So knowing the owner's email is not enough to enroll a
-//! passkey first.
+//! the request (RFC 9421, see [`crate::signing`]). So knowing the owner's email
+//! is not enough to enroll a passkey first.
 
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-use crate::{keys, platform};
-
-/// Prefix of the message signed for a passkey link.
-pub const SIGN_PREFIX: &str = "webmcp-passkey-link-v1\n";
-
-/// The exact bytes signed: `"webmcp-passkey-link-v1\n" + device_id + "\n" + ts`,
-/// with `ts` in decimal as sent.
-pub fn sign_message(device_id: &str, ts: u64) -> Vec<u8> {
-    format!("{SIGN_PREFIX}{device_id}\n{ts}").into_bytes()
-}
-
-/// Request body for `POST /api/v1/device/passkey-link`.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct LinkRequest {
-    pub device_id: String,
-    /// Unix seconds on this machine's clock.
-    pub ts: u64,
-    /// Standard base64 of the 64-byte Ed25519 signature.
-    pub signature: String,
-}
-
-impl LinkRequest {
-    pub fn signed(device_id: &str, key: &SigningKey, ts: u64) -> Self {
-        LinkRequest {
-            device_id: device_id.to_string(),
-            ts,
-            signature: keys::sign_b64(key, &sign_message(device_id, ts)),
-        }
-    }
-}
+use crate::{platform, signing};
 
 /// The success body: a link to open, good for `expires_in` seconds.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -120,6 +91,21 @@ pub fn link_url(base_url: &str) -> String {
 
 /// Ask the gateway at `base_url` for a passkey link, signed with the device
 /// key as of `ts` (Unix seconds).
+/// `link` is on `base_url`'s scheme and host.
+fn same_site(base_url: &str, link: &str) -> bool {
+    match (url::Url::parse(base_url), url::Url::parse(link)) {
+        (Ok(b), Ok(l)) => {
+            matches!(l.scheme(), "https" | "http")
+                && l.scheme() == b.scheme()
+                && l.host_str().is_some()
+                && l.host_str().map(str::to_ascii_lowercase)
+                    == b.host_str().map(str::to_ascii_lowercase)
+                && l.port_or_known_default() == b.port_or_known_default()
+        }
+        _ => false,
+    }
+}
+
 pub async fn request_link(
     base_url: &str,
     device_id: &str,
@@ -136,12 +122,31 @@ pub async fn request_link(
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(transport)?;
-    let resp = client
+    let local = |detail: String| PasskeyError::Unexpected {
+        status: 0,
+        url: url.clone(),
+        body: detail,
+    };
+    let parsed = url::Url::parse(&url).map_err(|e| local(e.to_string()))?;
+    let body = b"{}";
+    let signed = signing::sign(
+        key,
+        device_id,
+        "POST",
+        &parsed,
+        Some(body),
+        ts,
+        &signing::nonce(),
+    )
+    .map_err(|e| local(e.to_string()))?;
+    let mut req = client
         .post(&url)
-        .json(&LinkRequest::signed(device_id, key, ts))
-        .send()
-        .await
-        .map_err(transport)?;
+        .header("Content-Type", "application/json")
+        .body(body.to_vec());
+    for (name, value) in signed.pairs() {
+        req = req.header(name, value);
+    }
+    let resp = req.send().await.map_err(transport)?;
     let status = resp.status().as_u16();
     let body = resp.text().await.map_err(transport)?;
     let unexpected = |body: String| PasskeyError::Unexpected {
@@ -156,11 +161,15 @@ pub async fn request_link(
     if (200..300).contains(&status) {
         let link: PasskeyLink = serde_json::from_str(&body)
             .map_err(|e| unexpected(format!("could not parse body ({e}): {body}")))?;
-        // It is printed and handed to the browser opener: never a file or
-        // app-specific scheme.
-        return match url::Url::parse(&link.url) {
-            Ok(u) if matches!(u.scheme(), "https" | "http") => Ok(link),
-            _ => Err(unexpected(format!("not a web link: {}", link.url))),
+        // It is printed and handed to the browser opener: only a page on the
+        // site this machine is paired with, never a file or app scheme.
+        return if same_site(base_url, &link.url) {
+            Ok(link)
+        } else {
+            Err(unexpected(format!(
+                "not a link to {base_url}: {}",
+                link.url
+            )))
         };
     }
     match serde_json::from_str::<ErrorBody>(&body) {
@@ -201,11 +210,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn signed_string_layout() {
-        assert_eq!(
-            sign_message("dev_abc", 1_790_000_000),
-            b"webmcp-passkey-link-v1\ndev_abc\n1790000000"
-        );
+    fn links_must_point_at_the_paired_site() {
+        assert!(same_site(
+            "https://webmcp.fast",
+            "https://webmcp.fast/app/security?link=x"
+        ));
+        assert!(same_site(
+            "http://localhost:8788",
+            "http://localhost:8788/app/security"
+        ));
+        assert!(!same_site(
+            "https://webmcp.fast",
+            "https://evil.example/app/security"
+        ));
+        assert!(!same_site(
+            "https://webmcp.fast",
+            "http://webmcp.fast/app/security"
+        ));
+        assert!(!same_site(
+            "https://webmcp.fast",
+            "https://webmcp.fast.evil.example/"
+        ));
+        assert!(!same_site("https://webmcp.fast", "file:///etc/passwd"));
+    }
+
+    #[test]
+    fn link_url_joins() {
         assert_eq!(
             link_url("https://webmcp.fast/"),
             "https://webmcp.fast/api/v1/device/passkey-link"

@@ -19,6 +19,7 @@ use tracing::{debug, info, warn};
 
 use crate::approvals::{Admission, Recorder};
 use crate::config::ServerEntry;
+use crate::confirm::Confirmer;
 use crate::keys;
 use crate::platform;
 use crate::proto::{
@@ -27,6 +28,7 @@ use crate::proto::{
 };
 use crate::relay::{Relay, RelayOptions, MAX_GATEWAY_FRAME_BYTES};
 use crate::reload::{ConfigWatcher, Pairing, DEFAULT_POLL_INTERVAL};
+use crate::signing;
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -68,6 +70,8 @@ pub struct ConnectOptions {
     /// Desktop notification when an agent waits for approval. Off unless the
     /// CLI turns it on, so a library user or a test never pops one.
     pub notify: bool,
+    /// Answers tool-call confirmations; `None` is the desktop dialog.
+    pub confirmer: Option<Confirmer>,
     /// How often `config_path` is checked for changes.
     pub config_poll_interval: Duration,
     /// Session limits and timeouts for the relay.
@@ -97,6 +101,7 @@ impl ConnectOptions {
             admission: Admission::Open,
             config_path: None,
             notify: false,
+            confirmer: None,
             config_poll_interval: DEFAULT_POLL_INTERVAL,
             relay: RelayOptions::default(),
             once: false,
@@ -176,6 +181,10 @@ pub enum ConnectError {
     Eof,
     #[error("protocol error during handshake: {0}")]
     Handshake(String),
+    #[error(
+        "the gateway says this machine's clock is more than 5 minutes off; correct it (retrying)"
+    )]
+    ClockSkew,
     #[error("handshake timed out waiting for {0}")]
     Timeout(&'static str),
     #[error("{0} pongs missed; connection considered dead")]
@@ -269,6 +278,24 @@ async fn connection(
         tungstenite::http::header::USER_AGENT,
         platform::user_agent().parse().expect("static user agent"),
     );
+    // The upgrade itself proves the device (RFC 9421), so the gateway can
+    // refuse a stranger before any socket exists.
+    let signed = signing::sign(
+        &opts.signing_key,
+        &opts.device_id,
+        "GET",
+        &url,
+        None,
+        signing::now(),
+        &signing::nonce(),
+    )
+    .map_err(|e| ConnectError::Handshake(e.to_string()))?;
+    for (name, value) in signed.pairs() {
+        let value = value
+            .parse()
+            .map_err(|_| ConnectError::Handshake(format!("unencodable {name} header")))?;
+        request.headers_mut().insert(name, value);
+    }
     debug!(%url, "dialling relay");
     let ws_config = WebSocketConfig::default().max_message_size(Some(MAX_WS_MESSAGE_BYTES));
     let dialled =
@@ -277,6 +304,22 @@ async fn connection(
         Ok(ok) => ok,
         Err(tungstenite::Error::Http(resp)) if resp.status() == 404 => {
             return Err(ConnectError::UnknownDevice);
+        }
+        Err(tungstenite::Error::Http(resp)) => {
+            let code = resp
+                .body()
+                .as_deref()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string));
+            return Err(match (resp.status().as_u16(), code.as_deref()) {
+                (400, Some("clock_skew")) => ConnectError::ClockSkew,
+                // A bad signature means the gateway holds a different key.
+                (401, Some("bad_signature")) => ConnectError::Unauthorized,
+                (status, code) => ConnectError::Handshake(format!(
+                    "upgrade refused with HTTP {status}{}",
+                    code.map(|c| format!(" ({c})")).unwrap_or_default()
+                )),
+            });
         }
         Err(e) => return Err(e.into()),
     };
@@ -304,6 +347,9 @@ async fn connection(
         opts.relay.clone(),
         out.clone(),
     );
+    if let Some(confirmer) = &opts.confirmer {
+        relay = relay.with_confirmer(confirmer.clone());
+    }
 
     let result = async {
         if !advertise(&out, watcher).await? {
@@ -389,8 +435,21 @@ async fn handshake(ws: &mut Ws, opts: &ConnectOptions) -> Result<Welcome, Connec
     };
     ws.send(Message::text(hello.to_json()?)).await?;
 
+    // A gateway that verified the signed upgrade welcomes at once; one that
+    // did not (before RFC 9421 support) sends the in-band challenge.
     let nonce = loop {
         match next_frame(ws, opts.handshake_timeout, "challenge").await? {
+            Incoming::Frame(Frame::Welcome {
+                handle,
+                device,
+                server_time,
+            }) => {
+                return Ok(Welcome {
+                    handle,
+                    device,
+                    server_time,
+                })
+            }
             Incoming::Frame(Frame::Challenge { nonce }) => break nonce,
             Incoming::Frame(Frame::Error { code, message }) => {
                 warn!(%code, message = message.as_deref().unwrap_or(""), "gateway error before challenge");

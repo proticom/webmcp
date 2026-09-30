@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::approvals::Admission;
 use crate::error::Error;
+use crate::policy::{Confirm, ToolPolicy};
 use crate::proto::{CredentialKind, ServerInfo, ServerStatus, SessionMode, Transport};
 
 /// Name of the config file inside the config directory.
@@ -97,8 +98,8 @@ pub struct ServerEntry {
     pub url: Option<String>,
     #[serde(default)]
     pub mode: SessionMode,
-    /// Extra environment for the spawned `stdio` process (added to the
-    /// daemon's own environment).
+    /// Environment for the spawned `stdio` process, on top of a short
+    /// allowlist from the daemon's own (PATH, HOME, locale, proxy, temp dirs).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
     /// Working directory of the spawned `stdio` process.
@@ -108,6 +109,17 @@ pub struct ServerEntry {
     /// daemon default ([`crate::relay::DEFAULT_MAX_SESSIONS`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_sessions: Option<usize>,
+    /// When a tool call waits for the owner's Allow on this machine.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub confirm: Confirm,
+    /// Which tools agents may see and call. Enforced here whatever the
+    /// gateway allows; the dashboard can only narrow it further.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub tools: ToolPolicy,
+}
+
+fn is_default<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
 }
 
 /// Advertised for `shared` stdio servers until id remapping lands.
@@ -137,6 +149,8 @@ impl ServerEntry {
             env: BTreeMap::new(),
             cwd: None,
             max_sessions: None,
+            confirm: Confirm::default(),
+            tools: ToolPolicy::default(),
         })
     }
 
@@ -154,6 +168,8 @@ impl ServerEntry {
             env: BTreeMap::new(),
             cwd: None,
             max_sessions: None,
+            confirm: Confirm::default(),
+            tools: ToolPolicy::default(),
         })
     }
 
@@ -326,6 +342,14 @@ impl Config {
         }
         self.servers.push(entry);
         Ok(())
+    }
+
+    /// An attached server, to change in place.
+    pub fn server_mut(&mut self, alias: &str) -> Result<&mut ServerEntry, Error> {
+        self.servers
+            .iter_mut()
+            .find(|s| s.alias == alias)
+            .ok_or_else(|| Error::NoSuchAlias(alias.to_string()))
     }
 
     /// Remove a server by alias.
